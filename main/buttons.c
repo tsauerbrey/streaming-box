@@ -38,7 +38,7 @@ static const char *TAG = "buttons";
 #define DEBOUNCE_MS      50   // Stable period before accepting state change
 #define REPEAT_DELAY_MS  500  // Hold duration before auto-repeat starts
 #define REPEAT_INTERVAL  200  // Auto-repeat interval for volume buttons
-#define LONG_PRESS_MS    3000 // Play/pause long press for deep sleep
+#define LONG_PRESS_MS    2000 // Play/pause long press for deep sleep
 #define DOUBLE_CLICK_MS  350  // Window to detect a second play/pause press
 #define ACTION_QUEUE_LEN 8
 
@@ -75,6 +75,7 @@ typedef struct {
   TimerHandle_t long_press_timer; // Only created for play/pause button
   TimerHandle_t click_timer;      // Double-click window (play/pause only)
   int click_count;                // Presses seen within the double-click window
+  bool long_press_fired;
 } button_state_t;
 
 static button_state_t buttons[BTN_COUNT];
@@ -128,8 +129,7 @@ static void button_action_task(void *pvParameters) {
         // Deep sleep — this is handled in the timer callback; just log
         // in case the action fires (shouldn't normally happen since
         // long_press_timer_cb calls esp_deep_sleep_start immediately)
-        ESP_LOGW(TAG,
-                 "Long press action received (deep sleep already attempted)");
+        ESP_LOGI(TAG, "Streaming-Box: EC11 long press detected");
         break;
       case BTN_CHANNEL_CYCLE:
         audio_output_cycle_channel_mode();
@@ -170,6 +170,7 @@ static void debounce_timer_cb(TimerHandle_t timer) {
   btn->pressed = now_pressed;
 
   if (now_pressed) {
+    btn->long_press_fired = false;
     if (btn->click_timer) {
       // Play/pause button: defer the action so we can tell a single click
       // (play/pause) from a double click (cycle channel mode). Count the
@@ -177,8 +178,8 @@ static void debounce_timer_cb(TimerHandle_t timer) {
       // dispatches the right action when the window expires.
       btn->click_count++;
       xTimerChangePeriod(btn->click_timer, pdMS_TO_TICKS(DOUBLE_CLICK_MS), 0);
-    } else {
-      // Other buttons — fire immediately via the dedicated task
+    } else if (id != BTN_PLAY_PAUSE) {
+      // Other buttons fire on press; play/pause fires on release.
       post_button_action((button_id_t)id);
     }
 
@@ -203,34 +204,38 @@ static void debounce_timer_cb(TimerHandle_t timer) {
 #if CONFIG_BTN_PLAY_PAUSE_DOUBLE_CLICK
     // If the click window expired while the button was still held, dispatch
     // play/pause on release (not on the timer — that would fire mid-hold).
-    if (btn->click_timer && btn->click_count == 1 &&
+    if (!btn->long_press_fired && btn->click_timer &&
+        btn->click_count == 1 &&
         xTimerIsTimerActive(btn->click_timer) == pdFALSE) {
       btn->click_count = 0;
+      post_button_action(BTN_PLAY_PAUSE);
+    }
+#else
+    // No double-click: dispatch short play/pause only on release.
+    if (id == BTN_PLAY_PAUSE && !btn->long_press_fired) {
       post_button_action(BTN_PLAY_PAUSE);
     }
 #endif
   }
 }
 
-// Long-press timer callback — powers the board off on play/pause.
-// On boards with a battery power latch (Waveshare ESP32-S3-Touch-LCD-1.54)
-// board_power_off() releases the latch and enters deep sleep so the rail
-// collapses cleanly. On boards without a latch the weak default just enters
-// deep sleep; arm the play/pause button as the wakeup source for those.
+// Long-press timer callback — Streaming-Box hardware test.
 static void long_press_timer_cb(TimerHandle_t timer) {
   int id = (int)(intptr_t)pvTimerGetTimerID(timer);
   button_state_t *btn = &buttons[id];
 
-  // Cancel any pending click so we don't also play/pause or cycle channels.
+  if (!btn->pressed) {
+    return;
+  }
+
+  btn->long_press_fired = true;
+
   if (btn->click_timer) {
     xTimerStop(btn->click_timer, 0);
     btn->click_count = 0;
   }
 
-  ESP_LOGI(TAG, "Long press detected — powering off");
-  gpio_wakeup_enable(CONFIG_BTN_PLAY_PAUSE_GPIO, GPIO_INTR_LOW_LEVEL);
-  esp_sleep_enable_gpio_wakeup();
-  board_power_off();
+  post_button_action(BTN_LONG_PRESS);
 }
 
 // Double-click window expired — dispatch based on how many presses we saw.
@@ -317,7 +322,7 @@ static void IRAM_ATTR rotary_isr_handler(void *arg) {
 // Configured a pin at a time, since the two channels may not agree on whether
 // an internal pull-up is available.
 static void configure_rotary_pin(int gpio) {
-  bool has_internal_pullup = (gpio < 34);
+  bool has_internal_pullup = true;
   gpio_config_t io_conf = {
       .pin_bit_mask = (1ULL << gpio),
       .mode = GPIO_MODE_INPUT,
@@ -389,9 +394,13 @@ static void configure_button(button_id_t id, int gpio, bool repeatable) {
 #endif
   }
 
-  // GPIOs 34-39 on ESP32 are input-only and lack internal pull-ups.
-  // An external pull-up resistor is required for those pins.
+  // ESP32-S3 GPIO42 supports an internal pull-up.
+  // Classic ESP32 GPIO34-39 do not.
+#if CONFIG_IDF_TARGET_ESP32S3
+  bool has_internal_pullup = true;
+#else
   bool has_internal_pullup = (gpio < 34);
+#endif
   gpio_config_t io_conf = {
       .pin_bit_mask = (1ULL << gpio),
       .mode = GPIO_MODE_INPUT,
