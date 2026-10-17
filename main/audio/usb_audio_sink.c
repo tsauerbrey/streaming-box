@@ -269,13 +269,19 @@ static void usb_sink_task(void *arg) {
         continue;
       }
       ESP_LOGI(TAG, "Host stream started");
+
+      // Obtain exclusive I2S ownership before changing its clock.
+      if (s_state_cb != NULL && !s_state_cb(true)) {
+        ESP_LOGE(TAG, "USB stream rejected: audio output not released");
+        ringbuf_drain();
+        continue;
+      }
+
       s_streaming = true;
+
       // An AirPlay session may have left the clock at its own rate, and this
       // path writes to I2S directly without resampling.
       audio_output_set_sample_rate(CONFIG_UAC_SAMPLE_RATE);
-      if (s_state_cb != NULL) {
-        s_state_cb(true);
-      }
       // The board keeps the amplifier in DAC_POWER_OFF until it sees these,
       // so without them the USB stream is written to a sleeping DAC.
       // CLIENT_CONNECTED also clears whatever the display was last showing.

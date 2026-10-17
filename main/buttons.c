@@ -32,6 +32,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/timers.h"
+#include "streaming_mode.h"
 
 static const char *TAG = "buttons";
 
@@ -126,10 +127,10 @@ static void button_action_task(void *pvParameters) {
         playback_control_prev();
         break;
       case BTN_LONG_PRESS:
-        // Deep sleep — this is handled in the timer callback; just log
-        // in case the action fires (shouldn't normally happen since
-        // long_press_timer_cb calls esp_deep_sleep_start immediately)
         ESP_LOGI(TAG, "Streaming-Box: EC11 long press detected");
+        if (!streaming_mode_request_toggle()) {
+          ESP_LOGW(TAG, "Streaming-Box: mode switch request failed");
+        }
         break;
       case BTN_CHANNEL_CYCLE:
         audio_output_cycle_channel_mode();

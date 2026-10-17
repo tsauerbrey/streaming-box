@@ -20,7 +20,9 @@
  * Callback invoked when A2DP connection state changes.
  * @param connected true on connect, false on disconnect
  */
-typedef void (*bt_a2dp_state_cb_t)(bool connected);
+// Return true to permit I2S takeover on connect.
+// Return false to deny takeover; ignored on disconnect.
+typedef bool (*bt_a2dp_state_cb_t)(bool connected);
 
 /**
  * Initialize and start the Bluetooth A2DP Sink.
@@ -39,6 +41,11 @@ esp_err_t bt_a2dp_sink_init(const char *device_name,
  * Check if a Bluetooth A2DP audio session is active.
  */
 bool bt_a2dp_sink_is_connected(void);
+
+/**
+ * Check whether Bluetooth currently owns the I2S audio output.
+ */
+bool bt_a2dp_sink_has_audio_ownership(void);
 
 /**
  * Enable or disable Bluetooth discoverability/connectability.

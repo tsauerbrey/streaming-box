@@ -4,6 +4,8 @@
 #include "audio_output.h"
 #include "audio_receiver.h"
 #include "buttons.h"
+#include "streaming_mode.h"
+#include "radio/radio_player.h"
 #include "spiram_task.h"
 #include "display.h"
 #include "dns_server.h"
@@ -48,6 +50,7 @@
 #include "esp_log.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 
 static const char *TAG = "main";
@@ -58,6 +61,35 @@ static const char *TAG = "main";
 static bool s_airplay_started = false;
 static bool s_airplay_infrastructure_ready = false;
 static bool s_audio_output_ready = false;
+
+// Streaming-Box operating mode.
+// Radio is always the initial mode after boot.
+static streaming_mode_t s_streaming_mode = STREAMING_MODE_RADIO;
+
+// Requests are processed by the central mode controller task.
+static QueueHandle_t s_mode_queue = NULL;
+
+typedef enum {
+    STREAMING_MODE_CMD_TOGGLE = 1,
+    STREAMING_MODE_CMD_NETWORK_UP,
+    STREAMING_MODE_CMD_AUDIO_OWNER_ACTIVE,
+    STREAMING_MODE_CMD_AUDIO_OWNER_IDLE
+} streaming_mode_command_t;
+
+streaming_mode_t streaming_mode_get(void) {
+    return s_streaming_mode;
+}
+
+bool streaming_mode_request_toggle(void) {
+    if (s_mode_queue == NULL) {
+        ESP_LOGW(TAG, "Streaming mode controller not initialized");
+        return false;
+    }
+
+    streaming_mode_command_t command = STREAMING_MODE_CMD_TOGGLE;
+
+    return xQueueSend(s_mode_queue, &command, 0) == pdTRUE;
+}
 
 /* Task stacks and ordinary malloc() need byte-addressable internal RAM.
  * MALLOC_CAP_INTERNAL on its own also counts the leftover IRAM that is added
@@ -90,6 +122,11 @@ static esp_err_t ensure_audio_output(void) {
 }
 
 static void start_airplay_services(void) {
+  if (s_streaming_mode != STREAMING_MODE_AIRPLAY) {
+    ESP_LOGI(TAG, "AirPlay start skipped: RADIO mode active");
+    return;
+  }
+
   if (s_airplay_started) {
     return;
   }
@@ -108,35 +145,148 @@ static void start_airplay_services(void) {
     ESP_ERROR_CHECK(hap_init());
     ESP_ERROR_CHECK(audio_receiver_init());
     ESP_ERROR_CHECK(ensure_audio_output());
-    mdns_airplay_init();
     s_airplay_infrastructure_ready = true;
   }
 
   audio_output_start();
 
-  ESP_ERROR_CHECK(rtsp_server_start());
+  esp_err_t rtsp_err = rtsp_server_start();
+  if (rtsp_err != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to start RTSP server: %s",
+             esp_err_to_name(rtsp_err));
+    audio_output_stop();
+    return;
+  }
 
+  mdns_airplay_init();
   s_airplay_started = true;
   playback_control_set_source(PLAYBACK_SOURCE_AIRPLAY);
   ESP_LOGI(TAG, "AirPlay ready");
   log_dram("airplay");
 }
-#if defined(CONFIG_BT_A2DP_ENABLE) || defined(CONFIG_USB_AUDIO_SINK)
-static void stop_airplay_services(void) {
+
+static bool stop_airplay_services(void) {
   if (!s_airplay_started) {
-    return;
+    return true;
   }
 
   ESP_LOGI(TAG, "Stopping AirPlay services...");
 
+  mdns_airplay_stop();
   rtsp_server_stop();
-  audio_output_stop();
+
+  bool rtsp_stopped = rtsp_server_is_fully_stopped();
+  bool audio_stopped = audio_output_stop_and_wait();
+
+  if (!rtsp_stopped || !audio_stopped) {
+    ESP_LOGE(TAG,
+             "AirPlay stop incomplete (RTSP: %s, audio: %s)",
+             rtsp_stopped ? "stopped" : "active",
+             audio_stopped ? "stopped" : "active");
+    return false;
+  }
 
   s_airplay_started = false;
   playback_control_set_source(PLAYBACK_SOURCE_NONE);
+
   ESP_LOGI(TAG, "AirPlay stopped");
+  return true;
 }
-#endif
+
+// Streaming-Box mode controller.
+// All mode transitions are executed in this task, never in button callbacks.
+static void streaming_mode_task(void *pvParameters) {
+  (void)pvParameters;
+
+  streaming_mode_command_t command;
+
+  ESP_LOGI(TAG, "Streaming-Box mode controller started (RADIO)");
+
+  while (1) {
+    if (xQueueReceive(s_mode_queue, &command, portMAX_DELAY) != pdTRUE) {
+      continue;
+    }
+
+    if (command == STREAMING_MODE_CMD_NETWORK_UP) {
+      if (ethernet_is_connected() || wifi_is_connected()) {
+        if (s_streaming_mode == STREAMING_MODE_AIRPLAY) {
+          ESP_LOGI(TAG, "Network available: checking AirPlay services");
+          start_airplay_services();
+        } else if (!radio_player_is_running()) {
+          ESP_LOGI(TAG, "Network available: starting radio player");
+          esp_err_t err = radio_player_start();
+          if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Radio network start failed: %s",
+                     esp_err_to_name(err));
+          }
+        }
+      }
+      continue;
+    }
+
+    if (command != STREAMING_MODE_CMD_TOGGLE) {
+      continue;
+    }
+
+    if (s_streaming_mode == STREAMING_MODE_RADIO) {
+      ESP_LOGI(TAG, "Streaming-Box: RADIO -> AIRPLAY");
+
+      // Release I2S before allowing AirPlay to start.
+      if (!radio_player_stop_and_wait()) {
+        ESP_LOGE(TAG,
+                 "Mode switch aborted: radio audio still active");
+        continue;
+      }
+
+      s_streaming_mode = STREAMING_MODE_AIRPLAY;
+
+      if (ethernet_is_connected() || wifi_is_connected()) {
+        start_airplay_services();
+      } else {
+        ESP_LOGW(TAG, "AirPlay selected, waiting for network");
+      }
+
+    } else {
+      ESP_LOGI(TAG, "Streaming-Box: AIRPLAY -> RADIO");
+
+      // Do not enter RADIO while USB or Bluetooth owns the output.
+      playback_source_t active_source = playback_control_get_source();
+      if (active_source == PLAYBACK_SOURCE_USB ||
+          active_source == PLAYBACK_SOURCE_BLUETOOTH) {
+        ESP_LOGW(TAG,
+                 "Mode switch denied: USB or Bluetooth owns audio output");
+        continue;
+      }
+
+      // Stop AirPlay before the radio player takes ownership of I2S.
+      if (!stop_airplay_services()) {
+        ESP_LOGE(TAG,
+                 "Mode switch aborted: AirPlay resources still active");
+        continue;
+      }
+
+      // AirPlay has released I2S. Now start the radio player.
+      s_streaming_mode = STREAMING_MODE_RADIO;
+
+      if (ethernet_is_connected() || wifi_is_connected()) {
+        esp_err_t radio_err = radio_player_start();
+        if (radio_err != ESP_OK) {
+          ESP_LOGE(TAG, "Failed to start radio player: %s",
+                   esp_err_to_name(radio_err));
+
+          // Restore AIRPLAY mode and services where possible.
+          s_streaming_mode = STREAMING_MODE_AIRPLAY;
+          start_airplay_services();
+          continue;
+        }
+
+        ESP_LOGI(TAG, "Radio mode selected; player started");
+      } else {
+        ESP_LOGW(TAG, "Radio selected, waiting for network");
+      }
+    }
+  }
+}
 
 static void network_monitor_task(void *pvParameters) {
   (void)pvParameters;
@@ -189,8 +339,12 @@ static void network_monitor_task(void *pvParameters) {
 #ifdef CONFIG_USB_AUDIO_SINK
       output_owned = output_owned || usb_audio_sink_is_streaming();
 #endif
-      if (!output_owned) {
-        start_airplay_services();
+      if (!output_owned && s_mode_queue != NULL) {
+        streaming_mode_command_t command = STREAMING_MODE_CMD_NETWORK_UP;
+
+        if (xQueueSend(s_mode_queue, &command, 0) != pdTRUE) {
+          ESP_LOGW(TAG, "Failed to queue network-up event");
+        }
       }
       if (dns_running) {
         dns_server_stop();
@@ -211,28 +365,52 @@ static void network_monitor_task(void *pvParameters) {
 // The USB host and AirPlay cannot both drive I2S, so hand the output
 // over for as long as the host is streaming.  Called from the sink's
 // writer task.
-static void on_usb_audio_state_changed(bool streaming) {
-#ifdef CONFIG_SENDSPIN_ENABLE
-  sendspin_set_output_available(!streaming);
-#endif
+static bool on_usb_audio_state_changed(bool streaming) {
   if (streaming) {
     ESP_LOGI(TAG, "USB audio streaming — disabling AirPlay");
-    stop_airplay_services();
-    playback_control_set_source(PLAYBACK_SOURCE_USB);
-  } else {
-    ESP_LOGI(TAG, "USB audio idle — re-enabling AirPlay");
-    playback_control_set_source(PLAYBACK_SOURCE_NONE);
-#ifdef CONFIG_BT_A2DP_ENABLE
-    if (bt_a2dp_sink_is_connected()) {
-      // Bluetooth owns the output while connected; leave it alone.
-      playback_control_set_source(PLAYBACK_SOURCE_BLUETOOTH);
-      return;
+
+    if (streaming_mode_get() != STREAMING_MODE_AIRPLAY) {
+      ESP_LOGW(TAG, "USB takeover denied: RADIO mode active");
+      return false;
     }
+
+    if (!stop_airplay_services()) {
+      ESP_LOGE(TAG, "USB takeover denied: AirPlay still active");
+      return false;
+    }
+
+#ifdef CONFIG_SENDSPIN_ENABLE
+    sendspin_set_output_available(false);
 #endif
-    if (ethernet_is_connected() || wifi_is_connected()) {
-      start_airplay_services();
-    }
+    playback_control_set_source(PLAYBACK_SOURCE_USB);
+    return true;
   }
+
+  if (streaming_mode_get() != STREAMING_MODE_AIRPLAY) {
+    ESP_LOGI(TAG, "USB audio idle — RADIO mode unchanged");
+    return true;
+  }
+
+  ESP_LOGI(TAG, "USB audio idle — re-enabling AirPlay");
+
+#ifdef CONFIG_SENDSPIN_ENABLE
+  sendspin_set_output_available(true);
+#endif
+
+  playback_control_set_source(PLAYBACK_SOURCE_NONE);
+
+#ifdef CONFIG_BT_A2DP_ENABLE
+  if (bt_a2dp_sink_has_audio_ownership()) {
+    playback_control_set_source(PLAYBACK_SOURCE_BLUETOOTH);
+    return true;
+  }
+#endif
+
+  if (ethernet_is_connected() || wifi_is_connected()) {
+    start_airplay_services();
+  }
+
+  return true;
 }
 #endif
 
@@ -266,7 +444,7 @@ static void on_sendspin_activity(bool active) {
 static void on_airplay_audio_active(bool active) {
   if (!active) {
 #ifdef CONFIG_BT_A2DP_ENABLE
-    if (bt_a2dp_sink_is_connected()) {
+    if (bt_a2dp_sink_has_audio_ownership()) {
       // Bluetooth took the output and stopping the RTSP server is what ended
       // the AirPlay session, so this release is an echo of that takeover, not
       // the speaker going free.
@@ -296,23 +474,48 @@ static void on_airplay_audio_active(bool active) {
 #endif
 
 #ifdef CONFIG_BT_A2DP_ENABLE
-static void on_bt_state_changed(bool connected) {
-#ifdef CONFIG_SENDSPIN_ENABLE
-  sendspin_set_output_available(!connected);
-#endif
+static bool on_bt_state_changed(bool connected) {
   if (connected) {
-    ESP_LOGI(TAG, "BT connected — disabling AirPlay");
-    stop_airplay_services();
+    ESP_LOGI(TAG, "BT connected — requesting audio output");
+
+    if (streaming_mode_get() != STREAMING_MODE_AIRPLAY) {
+      ESP_LOGW(TAG, "Bluetooth takeover denied: RADIO mode active");
+      return false;
+    }
+
+    if (!stop_airplay_services()) {
+      ESP_LOGE(TAG, "Bluetooth takeover denied: AirPlay still active");
+      return false;
+    }
+
+#ifdef CONFIG_SENDSPIN_ENABLE
+    sendspin_set_output_available(false);
+#endif
+
     bt_coex_post(BT_COEX_EVT_BT_CONNECTED);
     playback_control_set_source(PLAYBACK_SOURCE_BLUETOOTH);
-  } else {
-    ESP_LOGI(TAG, "BT disconnected — re-enabling AirPlay");
-    bt_coex_post(BT_COEX_EVT_BT_DISCONNECTED);
-    playback_control_set_source(PLAYBACK_SOURCE_NONE);
-    if (ethernet_is_connected() || wifi_is_connected()) {
-      start_airplay_services();
-    }
+    return true;
   }
+
+  if (streaming_mode_get() != STREAMING_MODE_AIRPLAY) {
+    ESP_LOGI(TAG, "BT disconnected — RADIO mode unchanged");
+    return true;
+  }
+
+  ESP_LOGI(TAG, "BT disconnected — releasing audio output");
+
+#ifdef CONFIG_SENDSPIN_ENABLE
+  sendspin_set_output_available(true);
+#endif
+
+  bt_coex_post(BT_COEX_EVT_BT_DISCONNECTED);
+  playback_control_set_source(PLAYBACK_SOURCE_NONE);
+
+  if (ethernet_is_connected() || wifi_is_connected()) {
+    start_airplay_services();
+  }
+
+  return true;
 }
 
 // Bluetooth hides itself while anything else owns the output, so this reacts to
@@ -544,7 +747,41 @@ void app_main(void) {
   // "Buffered start" log to see the headroom available for WiFi/TCP buffers.
   log_dram("boot baseline");
 
-  buttons_init();
+  // RADIO boots first and needs I2S even before AirPlay is started.
+  ESP_ERROR_CHECK(ensure_audio_output());
+
+  // Initialize the mode controller before enabling button input.
+  s_mode_queue = xQueueCreate(8, sizeof(streaming_mode_command_t));
+  if (s_mode_queue == NULL) {
+    ESP_LOGE(TAG, "Failed to create streaming mode queue");
+    return;
+  }
+
+  BaseType_t mode_task_created = xTaskCreate(
+      streaming_mode_task,
+      "stream_mode",
+      4096,
+      NULL,
+      5,
+      NULL);
+
+  if (mode_task_created != pdPASS) {
+    ESP_LOGE(TAG, "Failed to create streaming mode task");
+    vQueueDelete(s_mode_queue);
+    s_mode_queue = NULL;
+    return;
+  }
+
+  // Handle a network connection established before the mode queue existed.
+  if (ethernet_is_connected() || wifi_is_connected()) {
+    streaming_mode_command_t command = STREAMING_MODE_CMD_NETWORK_UP;
+
+    if (xQueueSend(s_mode_queue, &command, 0) != pdTRUE) {
+      ESP_LOGW(TAG, "Failed to queue initial network-up event");
+    }
+  }
+  
+  ESP_ERROR_CHECK(buttons_init());
 
   while (1) {
     vTaskDelay(pdMS_TO_TICKS(10000));

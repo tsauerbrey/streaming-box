@@ -17,6 +17,9 @@
 
 static const char *TAG = "mdns_airplay";
 
+// mDNS is shared with other services and must only be initialized once here.
+static bool s_mdns_initialized = false;
+
 // Longest single DNS label (RFC 1035). The mDNS component caps names at
 // MDNS_NAME_MAX_LEN, which is never smaller than this.
 #define MDNS_HOSTNAME_MAX_LEN 63
@@ -89,8 +92,18 @@ void mdns_airplay_init(void) {
   snprintf(service_name, sizeof(service_name), "%02X%02X%02X%02X%02X%02X@%s",
            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], device_name);
 
-  // Initialize mDNS
-  ESP_ERROR_CHECK(mdns_init());
+  // Initialize the shared mDNS subsystem only once.
+  if (!s_mdns_initialized) {
+	esp_err_t err = mdns_init();
+
+	if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+		ESP_LOGE(TAG, "mDNS initialization failed: %s",
+				esp_err_to_name(err));
+    return;
+  }
+
+  s_mdns_initialized = true;
+}
 
   // Set hostname. A bad name must not panic the device, so this is logged
   // like the service registrations below rather than ESP_ERROR_CHECK'd.
@@ -194,4 +207,23 @@ void mdns_airplay_init(void) {
   }
   ESP_LOGI(TAG, "_raop._tcp advertised on port %d (AirPlay %s)",
            airplay_rtsp_port(), airplay_v1 ? "1" : "2");
+}
+
+
+void mdns_airplay_stop(void) {
+  esp_err_t err;
+
+  err = mdns_service_remove("_airplay", "_tcp");
+  if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) {
+    ESP_LOGW(TAG, "Failed to remove _airplay._tcp: %s",
+             esp_err_to_name(err));
+  }
+
+  err = mdns_service_remove("_raop", "_tcp");
+  if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) {
+    ESP_LOGW(TAG, "Failed to remove _raop._tcp: %s",
+             esp_err_to_name(err));
+  }
+
+  ESP_LOGI(TAG, "AirPlay mDNS advertisements removed");
 }

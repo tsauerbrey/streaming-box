@@ -49,6 +49,7 @@ set( SRC_FILES
     "playback_control.c"
     "playback_events.c"
     "dacp_client.c"
+    "radio/radio_player.c"
 )
 
 # Select audio output implementation at compile time. audio_output_common.c
@@ -111,6 +112,7 @@ set( DEPS
     esp_timer
     esp_http_server
     esp_http_client
+    esp_audio_codec
     app_update
     json
     mbedtls

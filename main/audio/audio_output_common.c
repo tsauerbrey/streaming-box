@@ -87,6 +87,11 @@ __attribute__((weak)) bool audio_output_get_pipeline_us(int64_t *now_us,
 __attribute__((weak)) void audio_output_stop(void) {
 }
 
+__attribute__((weak)) bool audio_output_stop_and_wait(void) {
+  audio_output_stop();
+  return true;
+}
+
 __attribute__((weak)) uint32_t audio_output_get_underruns(void) {
   return 0;
 }

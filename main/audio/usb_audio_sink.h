@@ -18,7 +18,9 @@
  * callback is expected to stop the AirPlay services on `true` and restart
  * them on `false`.  Invoked from the sink's writer task, so it may block.
  */
-typedef void (*usb_audio_sink_state_cb_t)(bool streaming);
+// Return false to deny USB takeover when streaming becomes active.
+// The return value is ignored when streaming becomes inactive.
+typedef bool (*usb_audio_sink_state_cb_t)(bool streaming);
 
 /**
  * Start the UAC device and the writer task that drains it into the DAC.

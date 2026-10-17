@@ -409,9 +409,50 @@ void audio_output_stop(void) {
   }
 }
 
+bool audio_output_stop_and_wait(void) {
+  if (playback_task_handle == NULL) {
+    return true;
+  }
+
+  playback_running = false;
+
+  int timeout = 40;
+  while (playback_task_handle != NULL && timeout-- > 0) {
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+
+  if (playback_task_handle != NULL) {
+    ESP_LOGE(TAG, "Playback task did not stop; I2S handover denied");
+    return false;
+  }
+
+  ESP_LOGI(TAG, "Playback task stopped; I2S handover permitted");
+  return true;
+}
+
 esp_err_t audio_output_write(const void *data, size_t bytes, TickType_t wait) {
   size_t written = 0;
   return i2s_channel_write(tx_handle, data, bytes, &written, wait);
+}
+
+esp_err_t audio_output_write_complete(const void *data, size_t bytes,
+                                      TickType_t wait)
+{
+    size_t written = 0;
+    esp_err_t err = i2s_channel_write(tx_handle, data, bytes,
+                                      &written, wait);
+
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    if (written != bytes) {
+        ESP_LOGW(TAG, "Incomplete I2S write: %u of %u bytes",
+                 (unsigned)written, (unsigned)bytes);
+        return ESP_ERR_TIMEOUT;
+    }
+
+    return ESP_OK;
 }
 
 void audio_output_set_sample_rate(uint32_t rate) {

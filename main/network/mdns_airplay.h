@@ -13,3 +13,9 @@
  * With all required TXT records for iOS to recognize the device
  */
 void mdns_airplay_init(void);
+
+/**
+ * Remove AirPlay and RAOP service advertisements.
+ * Does not shut down the shared mDNS subsystem.
+ */
+void mdns_airplay_stop(void);

@@ -419,7 +419,13 @@ static void server_task(void *pvParameters) {
 
   struct sockaddr_in server_addr, client_addr;
   socklen_t client_addr_len = sizeof(client_addr);
-
+  // Never reset client slots while tasks from a previous run exist.
+  if (clients[0].task != NULL || clients[1].task != NULL) {
+    ESP_LOGE(TAG, "Cannot restart RTSP: previous client tasks still active");
+    server_task_handle = NULL;
+    vTaskDelete(NULL);
+    return;
+  }
   // Initialize slots
   for (int i = 0; i < 2; i++) {
     clients[i].socket = -1;
@@ -532,7 +538,20 @@ static void server_task(void *pvParameters) {
     }
   }
 
-  vTaskDelay(pdMS_TO_TICKS(500));
+  // Wait for both client tasks to finish their cleanup.
+  int timeout = 60;  // Maximum 6 seconds
+  while (timeout-- > 0) {
+    if (clients[0].task == NULL && clients[1].task == NULL) {
+      break;
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+
+  if (clients[0].task != NULL || clients[1].task != NULL) {
+    ESP_LOGE(TAG, "RTSP clients did not stop within timeout");
+  } else {
+    ESP_LOGI(TAG, "All RTSP client tasks stopped");
+  }
 
   if (server_socket >= 0) {
     close(server_socket);
@@ -562,6 +581,12 @@ esp_err_t rtsp_server_start(void) {
     }
   }
 
+  // Do not start a new server while clients from the previous run
+  // are still cleaning up.
+  if (clients[0].task != NULL || clients[1].task != NULL) {
+    ESP_LOGE(TAG, "Cannot start RTSP: previous client tasks still active");
+    return ESP_ERR_INVALID_STATE;
+  }
   // Parsing the key and deriving the first blinding pair costs the best part
   // of a second; a sender waiting on its OPTIONS response gives up before
   // that. Do it before the listener exists so it cannot land mid-request.
@@ -577,6 +602,12 @@ esp_err_t rtsp_server_start(void) {
   return ESP_OK;
 }
 
+bool rtsp_server_is_fully_stopped(void) {
+  return server_task_handle == NULL &&
+         clients[0].task == NULL &&
+         clients[1].task == NULL;
+}
+
 void rtsp_server_stop(void) {
   server_running = false;
 
@@ -587,7 +618,7 @@ void rtsp_server_stop(void) {
   }
 
   if (server_task_handle != NULL) {
-    if (!rtsp_server_wait_for_task_stopped(40)) {
+    if (!rtsp_server_wait_for_task_stopped(140)) {
       ESP_LOGW(TAG, "RTSP server task did not exit within timeout");
     }
   }

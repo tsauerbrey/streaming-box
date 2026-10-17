@@ -60,6 +60,13 @@ void audio_output_flush(void);
 void audio_output_stop(void);
 
 /**
+ * Stop the AirPlay playback task and verify that it has released I2S.
+ *
+ * @return true if the playback task has stopped, false on timeout.
+ */
+bool audio_output_stop_and_wait(void);
+
+/**
  * Write raw PCM data to the I2S output.
  * Can be used by any audio source (BT A2DP, etc.) when the AirPlay
  * playback task is stopped.
@@ -70,7 +77,14 @@ void audio_output_stop(void);
  * @return ESP_OK on success
  */
 esp_err_t audio_output_write(const void *data, size_t bytes, TickType_t wait);
-
+/**
+ * Write PCM data directly to I2S and verify the complete transfer.
+ * Intended for the radio player while the AirPlay output task is stopped.
+ *
+ * @return ESP_OK only if all requested bytes were written.
+ */
+esp_err_t audio_output_write_complete(const void *data, size_t bytes,
+                                      TickType_t wait);
 /**
  * Change the I2S sample rate (e.g. when BT negotiates 48 kHz)
  *

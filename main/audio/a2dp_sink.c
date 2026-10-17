@@ -99,6 +99,8 @@ typedef enum {
 
 static bt_a2dp_state_cb_t s_state_cb = NULL;
 static volatile bool s_connected = false;
+// Bluetooth may use I2S only after the application grants ownership.
+static volatile bool s_i2s_granted = false;
 static volatile bool s_audio_started = false;
 static volatile bool s_avrc_playing = false; /* AVRCP play state (instant) */
 static volatile bool s_i2s_task_running = false;
@@ -116,8 +118,14 @@ static RingbufHandle_t s_ringbuf = NULL;
 static SemaphoreHandle_t s_i2s_sem = NULL;
 static ringbuf_mode_t s_ringbuf_mode = RINGBUF_MODE_PREFETCHING;
 
+// Protect PCM callback admission and track callbacks still using resources.
+static portMUX_TYPE s_pcm_callback_lock = portMUX_INITIALIZER_UNLOCKED;
+static bool s_pcm_callbacks_enabled = false;
+static unsigned int s_pcm_callbacks_active = 0;
+
 static TaskHandle_t s_bt_task_handle = NULL;
 static TaskHandle_t s_i2s_task_handle = NULL;
+static bool s_i2s_writer_finished = false;
 static QueueHandle_t s_bt_task_queue = NULL;
 
 static uint32_t s_sample_rate = 44100;
@@ -182,7 +190,7 @@ static void bt_i2s_writer_task(void *arg) {
     void *data =
         xRingbufferReceiveUpTo(s_ringbuf, &item_size, pdMS_TO_TICKS(20), 512);
     if (data != NULL && item_size > 0) {
-      audio_output_write(data, item_size, portMAX_DELAY);
+      audio_output_write(data, item_size, pdMS_TO_TICKS(100));
       vRingbufferReturnItem(s_ringbuf, data);
     } else {
       // Buffer underrun — write silence to keep I2S fed
@@ -190,13 +198,21 @@ static void bt_i2s_writer_task(void *arg) {
     }
   }
 
-  s_i2s_task_handle = NULL;
-  vTaskDelete(NULL);
+  // All ringbuffer and I2S accesses have finished.
+  // Signal completion before waiting for controlled deletion.
+  portENTER_CRITICAL(&s_pcm_callback_lock);
+  s_i2s_writer_finished = true;
+  portEXIT_CRITICAL(&s_pcm_callback_lock);
+
+  for (;;) {
+    vTaskDelay(portMAX_DELAY);
+  }
 }
 
-static void i2s_task_start(void) {
+static bool i2s_task_start(void) {
   if (s_i2s_task_handle != NULL) {
-    return;
+    ESP_LOGE(TAG, "Bluetooth I2S writer already exists");
+    return false;
   }
 
   s_ringbuf_mode = RINGBUF_MODE_PREFETCHING;
@@ -208,12 +224,65 @@ static void i2s_task_start(void) {
     s_i2s_sem = xSemaphoreCreateBinary();
   }
 
+  if (s_ringbuf == NULL || s_i2s_sem == NULL) {
+    ESP_LOGE(TAG, "Bluetooth I2S writer: resource allocation failed");
+    return false;
+  }
+
+  // Discard a stale prefetch signal from an earlier start attempt.
+  xSemaphoreTake(s_i2s_sem, 0);
+
+  // A new writer must not inherit the previous writer's completion state.
+  portENTER_CRITICAL(&s_pcm_callback_lock);
+  s_i2s_writer_finished = false;
+  portEXIT_CRITICAL(&s_pcm_callback_lock);
+
   s_i2s_task_running = true;
-  xTaskCreatePinnedToCore(bt_i2s_writer_task, "bt_i2s", I2S_TASK_STACK, NULL,
-                          I2S_TASK_PRIO, &s_i2s_task_handle, I2S_TASK_CORE);
+  BaseType_t result =
+      xTaskCreatePinnedToCore(bt_i2s_writer_task, "bt_i2s", I2S_TASK_STACK,
+                              NULL, I2S_TASK_PRIO, &s_i2s_task_handle,
+                              I2S_TASK_CORE);
+  if (result != pdPASS) {
+    s_i2s_task_running = false;
+    s_i2s_task_handle = NULL;
+    ESP_LOGE(TAG, "Failed to create Bluetooth I2S writer task");
+    return false;
+  }
+
+  // Resources and writer task are ready: permit PCM callbacks.
+  portENTER_CRITICAL(&s_pcm_callback_lock);
+  s_pcm_callbacks_enabled = true;
+  portEXIT_CRITICAL(&s_pcm_callback_lock);
+
+  return true;
 }
 
-static void i2s_task_stop(void) {
+static bool i2s_task_stop(void) {
+  // Prevent new PCM callbacks from accessing resources being stopped.
+  portENTER_CRITICAL(&s_pcm_callback_lock);
+  s_pcm_callbacks_enabled = false;
+  portEXIT_CRITICAL(&s_pcm_callback_lock);
+
+  // Allow already admitted callbacks to finish before releasing resources.
+  bool callbacks_active = true;
+  for (int attempt = 0; attempt < 100; attempt++) {
+    portENTER_CRITICAL(&s_pcm_callback_lock);
+    callbacks_active = s_pcm_callbacks_active != 0;
+    portEXIT_CRITICAL(&s_pcm_callback_lock);
+
+    if (!callbacks_active) {
+      break;
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+
+  if (callbacks_active) {
+    ESP_LOGE(TAG, "Bluetooth PCM callbacks did not finish; retaining resources");
+    return false;
+  }
+
+  bool had_i2s_ownership = s_i2s_granted;
+
   s_i2s_task_running = false;
 
   // Unblock the writer if it's waiting on the semaphore
@@ -221,11 +290,32 @@ static void i2s_task_stop(void) {
     xSemaphoreGive(s_i2s_sem);
   }
 
-  // Wait for the task to exit
-  int timeout = 20;
-  while (s_i2s_task_handle != NULL && timeout-- > 0) {
-    vTaskDelay(pdMS_TO_TICKS(50));
+  // Wait until the writer confirms that all resource accesses ended.
+  if (s_i2s_task_handle != NULL) {
+    // Wait for explicit confirmation that the writer stopped using resources.
+    bool writer_finished = false;
+    for (int attempt = 0; attempt < 100; attempt++) {
+      portENTER_CRITICAL(&s_pcm_callback_lock);
+      writer_finished = s_i2s_writer_finished;
+      portEXIT_CRITICAL(&s_pcm_callback_lock);
+
+      if (writer_finished) {
+        break;
+      }
+      vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    if (!writer_finished) {
+      ESP_LOGE(TAG, "Bluetooth I2S writer did not finish; retaining resources");
+      return false;
+    }
+
+    vTaskDelete(s_i2s_task_handle);
+    s_i2s_task_handle = NULL;
   }
+
+  // Release I2S ownership only after the writer has stopped.
+  s_i2s_granted = false;
 
   // Flush and free the ringbuffer so heap is returned before AirPlay restarts
   if (s_ringbuf) {
@@ -243,9 +333,12 @@ static void i2s_task_stop(void) {
     s_i2s_sem = NULL;
   }
 
-  // Reset sample rate to AirPlay default
-  audio_output_set_sample_rate(44100);
-  audio_output_flush();
+  // Restore the default only if Bluetooth owned I2S.
+  if (had_i2s_ownership) {
+    audio_output_set_sample_rate(44100);
+    audio_output_flush();
+  }
+  return true;
 }
 
 /* ========================================================================== */
@@ -253,10 +346,20 @@ static void i2s_task_stop(void) {
 /* ========================================================================== */
 
 static void bt_a2dp_data_cb(const uint8_t *data, uint32_t len) {
-  // Snapshot the ringbuf handle so it can't be freed between the NULL
-  // check and the API calls (i2s_task_stop sets s_ringbuf = NULL).
-  RingbufHandle_t rb = s_ringbuf;
-  if (rb == NULL || len == 0) {
+  if (len == 0) {
+    return;
+  }
+
+  // Register resource access before using the ringbuffer or semaphore.
+  portENTER_CRITICAL(&s_pcm_callback_lock);
+  bool admitted = s_pcm_callbacks_enabled && s_ringbuf != NULL;
+  RingbufHandle_t rb = admitted ? s_ringbuf : NULL;
+  if (admitted) {
+    s_pcm_callbacks_active++;
+  }
+  portEXIT_CRITICAL(&s_pcm_callback_lock);
+
+  if (!admitted) {
     return;
   }
 
@@ -290,6 +393,10 @@ static void bt_a2dp_data_cb(const uint8_t *data, uint32_t len) {
     }
     break;
   }
+
+  portENTER_CRITICAL(&s_pcm_callback_lock);
+  s_pcm_callbacks_active--;
+  portEXIT_CRITICAL(&s_pcm_callback_lock);
 }
 
 /* ========================================================================== */
@@ -309,13 +416,38 @@ static void bt_a2dp_evt_handler(uint16_t event, void *param) {
       ESP_LOGI(TAG, "A2DP connected");
       s_connected = true;
 
-      // Notify main app to disable AirPlay (stops playback task + RTSP)
-      if (s_state_cb) {
-        s_state_cb(true);
+      // A previous writer must be fully stopped before a new takeover.
+      if (s_i2s_task_handle != NULL || s_i2s_granted) {
+        ESP_LOGE(TAG, "Bluetooth takeover denied: previous I2S ownership remains");
+        break;
       }
 
-      // Start BT playback
-      i2s_task_start();
+      // Request exclusive I2S ownership from the application.
+      s_i2s_granted = s_state_cb != NULL && s_state_cb(true);
+
+      if (!s_i2s_granted) {
+        ESP_LOGW(TAG, "Bluetooth connected without I2S ownership");
+        break;
+      }
+
+      // Apply the negotiated codec rate before starting the writer.
+      audio_output_set_sample_rate(s_sample_rate);
+
+      // Start BT playback only after ownership was granted.
+      if (!i2s_task_start()) {
+        ESP_LOGE(TAG, "Bluetooth I2S startup failed; releasing audio output");
+
+        // No writer was started, so release the granted ownership.
+        if (!i2s_task_stop()) {
+          ESP_LOGE(TAG, "Bluetooth I2S cleanup failed");
+          break;
+        }
+
+        if (s_state_cb) {
+          s_state_cb(false);
+        }
+        break;
+      }
 
       // LED/display: show connected state
       playback_events_emit(PLAYBACK_SOURCE_BLUETOOTH, PLAYBACK_EVENT_CONNECTED,
@@ -332,15 +464,22 @@ static void bt_a2dp_evt_handler(uint16_t event, void *param) {
       s_audio_started = false;
       s_avrc_playing = false;
 
-      // Stop BT playback
-      i2s_task_stop();
+      // Remember ownership before i2s_task_stop() releases it.
+      bool had_i2s_ownership = s_i2s_granted;
+
+      // Stop BT playback. Do not release audio ownership on timeout.
+      bool i2s_stopped = i2s_task_stop();
+      if (!i2s_stopped) {
+        ESP_LOGE(TAG, "Bluetooth disconnect: I2S writer still active");
+        break;
+      }
 
       // LED/display: show disconnected state
       playback_events_emit(PLAYBACK_SOURCE_BLUETOOTH,
                            PLAYBACK_EVENT_DISCONNECTED, NULL);
 
       // Notify main app to re-enable AirPlay (restarts playback + RTSP)
-      if (s_state_cb) {
+      if (had_i2s_ownership && s_state_cb) {
         s_state_cb(false);
       }
 
@@ -353,6 +492,12 @@ static void bt_a2dp_evt_handler(uint16_t event, void *param) {
   }
 
   case ESP_A2D_AUDIO_STATE_EVT: {
+    if (!s_i2s_granted) {
+      ESP_LOGD(TAG, "Ignoring Bluetooth audio state without I2S ownership");
+      s_audio_started = false;
+      break;
+    }
+
     esp_a2d_audio_state_t state = a2d->audio_stat.state;
     if (state == ESP_A2D_AUDIO_STATE_STARTED) {
       ESP_LOGI(TAG, "Audio stream started");
@@ -383,7 +528,12 @@ static void bt_a2dp_evt_handler(uint16_t event, void *param) {
         s_sample_rate = 16000;
       }
       ESP_LOGI(TAG, "SBC sample rate: %" PRIu32 " Hz", s_sample_rate);
-      audio_output_set_sample_rate(s_sample_rate);
+
+      if (s_i2s_granted) {
+        audio_output_set_sample_rate(s_sample_rate);
+      } else {
+        ESP_LOGW(TAG, "Skipping Bluetooth I2S clock change: ownership denied");
+      }
     }
     break;
   }
@@ -898,6 +1048,10 @@ bool bt_a2dp_sink_is_connected(void) {
   return s_connected;
 }
 
+bool bt_a2dp_sink_has_audio_ownership(void) {
+  return s_i2s_granted;
+}
+
 void bt_a2dp_sink_set_discoverable(bool discoverable) {
   s_bt_discoverable = discoverable;
   if (s_connected || s_bt_suspended) {
@@ -948,6 +1102,10 @@ static void bt_wait_for_heap_reclaim(void) {
 static esp_err_t bt_suspend_locked(void) {
   if (s_bt_suspended) {
     return ESP_OK;
+  }
+  if (s_i2s_task_handle != NULL || s_i2s_granted) {
+    ESP_LOGE(TAG, "Not suspending BT: I2S resources still owned");
+    return ESP_ERR_INVALID_STATE;
   }
   if (s_connected) {
     // A phone is actively streaming over BT — don't pull the radio out from
