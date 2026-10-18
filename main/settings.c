@@ -65,6 +65,16 @@ esp_err_t settings_init(void) {
     err = nvs_get_i32(nvs, NVS_KEY_VOLUME, &vol_fixed);
     if (err == ESP_OK) {
       g_volume_db = (float)vol_fixed / 100.0f;
+
+      // Streaming-Box: limit the restored startup volume.
+      // Normal volume adjustments may still reach 0 dB.
+      if (g_volume_db > -20.0f) {
+        ESP_LOGW(TAG,
+                 "Startup volume limited: %.2f -> -20.00 dB",
+                 g_volume_db);
+        g_volume_db = -20.0f;
+      }
+
       g_volume_loaded = true;
       ESP_LOGI(TAG, "Loaded volume: %.2f dB", g_volume_db);
     }

@@ -19,6 +19,7 @@
  */
 
 #include "playback_control.h"
+#include "streaming_mode.h"
 
 #include "dac.h"
 #include "dacp_client.h"
@@ -42,7 +43,7 @@
 
 static const char *TAG = "playback_ctrl";
 
-#define VOLUME_STEP_DB 3.0f
+#define VOLUME_STEP_DB 1.0f
 #define VOLUME_MIN_DB  (-30.0f)
 #define VOLUME_MAX_DB  0.0f
 
@@ -189,6 +190,11 @@ void playback_control_play_pause(void) {
 }
 
 void playback_control_volume_up(void) {
+  if (streaming_mode_get() == STREAMING_MODE_RADIO) {
+    local_adjust_volume(VOLUME_STEP_DB);
+    return;
+  }
+
   switch (s_source) {
   case PLAYBACK_SOURCE_AIRPLAY:
   case PLAYBACK_SOURCE_SENDSPIN:
@@ -210,6 +216,11 @@ void playback_control_volume_up(void) {
 }
 
 void playback_control_volume_down(void) {
+  if (streaming_mode_get() == STREAMING_MODE_RADIO) {
+    local_adjust_volume(-VOLUME_STEP_DB);
+    return;
+  }
+
   switch (s_source) {
   case PLAYBACK_SOURCE_AIRPLAY:
   case PLAYBACK_SOURCE_SENDSPIN:

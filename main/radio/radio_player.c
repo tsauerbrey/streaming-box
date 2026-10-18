@@ -8,6 +8,7 @@
 #include "sdkconfig.h"
 #include "esp_audio_types.h"
 #include "esp_http_client.h"
+#include "esp_crt_bundle.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -43,6 +44,7 @@ typedef struct {
     int16_t *stereo;
     size_t stereo_samples;
     bool format_logged;
+    uint32_t output_sample_rate;
 	bool playback_started;
     esp_err_t fatal_error;
 } radio_ctx_t;
@@ -81,15 +83,23 @@ static bool write_pcm(radio_ctx_t *c, const esp_audio_dec_info_t *info,
 {
     if (!bytes || !info->sample_rate || !info->channel || !info->bits_per_sample)
         return true;
-    if (info->sample_rate != CONFIG_OUTPUT_SAMPLE_RATE_HZ ||
+    if ((info->sample_rate != 44100 && info->sample_rate != 48000) ||
         info->bits_per_sample != 16 || (info->channel != 1 && info->channel != 2)) {
-        ESP_LOGE(TAG, "Unsupported MP3 format: %lu Hz, %u-bit, %u channel(s); output is %u Hz stereo",
+        ESP_LOGE(TAG, "Unsupported MP3 format: %lu Hz, %u-bit, %u channel(s); supported: 44100/48000 Hz, 16-bit, mono/stereo",
                  (unsigned long)info->sample_rate, info->bits_per_sample,
-                 info->channel, (unsigned)CONFIG_OUTPUT_SAMPLE_RATE_HZ);
+                 info->channel);
         c->fatal_error = ESP_ERR_NOT_SUPPORTED;
         return false;
     }
     if (bytes % (sizeof(int16_t) * info->channel)) return false;
+
+    if (c->output_sample_rate != info->sample_rate) {
+        ESP_LOGI(TAG, "Radio I2S sample rate: %lu Hz",
+                 (unsigned long)info->sample_rate);
+        audio_output_set_sample_rate(info->sample_rate);
+        c->output_sample_rate = info->sample_rate;
+    }
+
     if (!c->format_logged) {
         ESP_LOGI(TAG, "MP3 format: %lu Hz, %u-bit, %s",
                  (unsigned long)info->sample_rate, info->bits_per_sample,
@@ -101,8 +111,44 @@ static bool write_pcm(radio_ctx_t *c, const esp_audio_dec_info_t *info,
                              PLAYBACK_EVENT_PLAYING, NULL);
         c->playback_started = true;
     }
-    if (info->channel == 2)
-        return audio_output_write_complete(c->pcm, bytes, pdMS_TO_TICKS(RADIO_I2S_TIMEOUT_MS)) == ESP_OK;
+    if (info->channel == 2) {
+        static unsigned pcm_diag_blocks = 0;
+        static unsigned pcm_diag_nonzero_blocks = 0;
+        static int32_t pcm_diag_max_peak = 0;
+        if (pcm_diag_blocks < 500) {
+            const int16_t *samples = (const int16_t *)c->pcm;
+            size_t count = bytes / sizeof(int16_t);
+            int32_t peak = 0;
+            size_t nonzero = 0;
+
+            for (size_t i = 0; i < count; ++i) {
+                int32_t v = samples[i];
+                if (v < 0) v = -v;
+                if (v > peak) peak = v;
+                if (v != 0) nonzero++;
+            }
+
+            if (nonzero) pcm_diag_nonzero_blocks++;
+            if (peak > pcm_diag_max_peak) pcm_diag_max_peak = peak;
+            pcm_diag_blocks++;
+
+            if (pcm_diag_blocks % 50 == 0) {
+                ESP_LOGW(TAG,
+                         "PCM DIAG: blocks=%u nonzero_blocks=%u max_peak=%ld",
+                         pcm_diag_blocks, pcm_diag_nonzero_blocks,
+                         (long)pcm_diag_max_peak);
+            }
+        }
+
+        esp_err_t err = audio_output_write_complete(
+            c->pcm, bytes, pdMS_TO_TICKS(RADIO_I2S_TIMEOUT_MS));
+
+        if (pcm_diag_blocks == 1) {
+            ESP_LOGW(TAG, "I2S DIAG: write=%s", esp_err_to_name(err));
+        }
+
+        return err == ESP_OK;
+    }
 
     size_t n = bytes / sizeof(int16_t), needed = n * 2;
     if (needed > c->stereo_samples) {
@@ -225,6 +271,7 @@ static esp_err_t radio_reset_decoder(radio_ctx_t *c)
     }
     c->input_len = 0;
     c->format_logged = false;
+    c->output_sample_rate = 0;
     c->fatal_error = ESP_OK;
 
     if (esp_mp3_dec_open(NULL, 0, &c->decoder) != ESP_AUDIO_ERR_OK) {
@@ -263,8 +310,9 @@ static void radio_task(void *arg)
     c.pcm = malloc(c.pcm_bytes);
     esp_err_t result = ESP_OK;
 	uint8_t *http_buffer = malloc(RADIO_HTTP_READ_BUFFER_SIZE);
+    char *stream_url = malloc(RADIO_STATION_URL_MAX);
 
-    if (!c.input || !c.pcm || !http_buffer) {
+    if (!c.input || !c.pcm || !http_buffer || !stream_url) {
     result = ESP_ERR_NO_MEM;
     goto done;
 }
@@ -279,11 +327,46 @@ static void radio_task(void *arg)
             break;
         }
 
-		esp_http_client_config_t config = {
-		    .url = RADIO_TEST_STREAM_URL,
+		const char *selected_url = RADIO_TEST_STREAM_URL;
+        size_t selected_index = 0;
+
+        esp_err_t selection_err =
+            radio_stations_get_selected(&selected_index);
+
+        if (selection_err == ESP_OK) {
+            radio_station_t *station = malloc(sizeof(*station));
+            if (station == NULL) {
+                result = ESP_ERR_NO_MEM;
+                break;
+            }
+
+            result = radio_stations_get(selected_index, station);
+            if (result == ESP_OK) {
+                selected_url = station->url;
+                memcpy(stream_url, selected_url,
+                       strlen(selected_url) + 1);
+            }
+            free(station);
+
+            if (result != ESP_OK) {
+                break;
+            }
+        } else if (selection_err == ESP_ERR_NOT_FOUND) {
+            memcpy(stream_url, RADIO_TEST_STREAM_URL,
+                   sizeof(RADIO_TEST_STREAM_URL));
+        } else {
+            ESP_LOGE(TAG, "Cannot read selected radio station: %s",
+                     esp_err_to_name(selection_err));
+            result = selection_err;
+            break;
+        }
+
+        esp_http_client_config_t config = {
+		    .url = stream_url,
 		    .timeout_ms = HTTP_TIMEOUT_MS,
 		    .buffer_size = RADIO_HTTP_READ_BUFFER_SIZE,
 		    .disable_auto_redirect = true,
+		    .crt_bundle_attach = esp_crt_bundle_attach,
 		};
 
         esp_http_client_handle_t client = esp_http_client_init(&config);
@@ -294,7 +377,7 @@ static void radio_task(void *arg)
 		int redirect_count = 0;
 		int http_status = 0;
         esp_http_client_set_header(client, "Icy-MetaData", "0");
-        ESP_LOGI(TAG, "Opening radio stream: %s", RADIO_TEST_STREAM_URL);
+        ESP_LOGI(TAG, "Opening radio stream: %s", stream_url);
 
         while (!atomic_load(&s_stop_requested)) {
             result = esp_http_client_open(client, 0);
@@ -437,6 +520,7 @@ done:
                              PLAYBACK_EVENT_DISCONNECTED, NULL);
         c.playback_started = false;
     }
+    free(stream_url);
     free(http_buffer);
     cleanup_ctx(&c);
     // No I2S access after this point; the mode controller may now hand it over.

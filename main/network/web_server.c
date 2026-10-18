@@ -17,6 +17,8 @@
 #include "esp_wifi.h"
 
 #include "playback_control.h"
+#include "radio/radio_stations.h"
+#include "streaming_mode.h"
 #include "settings.h"
 #include "led.h"
 #include "wifi.h"
@@ -110,6 +112,214 @@ static esp_err_t favicon_handler(httpd_req_t *req) {
   httpd_resp_set_status(req, "204 No Content");
   httpd_resp_send(req, NULL, 0);
   return ESP_OK;
+}
+
+static esp_err_t radio_page_handler(httpd_req_t *req) {
+  return serve_spiffs_file(req, "/spiffs/www/radio.html", "text/html");
+}
+
+#define RADIO_API_MAX_BODY 1024
+
+static cJSON *radio_api_read_json(httpd_req_t *req) {
+  if (req->content_len <= 0 ||
+      req->content_len > RADIO_API_MAX_BODY) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                        "Invalid radio request size");
+    return NULL;
+  }
+
+  char content[RADIO_API_MAX_BODY + 1];
+  size_t received = 0;
+  size_t expected = (size_t)req->content_len;
+
+  while (received < expected) {
+    int ret = httpd_req_recv(req, content + received,
+                             expected - received);
+    if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
+      continue;
+    }
+    if (ret <= 0) {
+      httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                          "Incomplete radio request");
+      return NULL;
+    }
+    received += (size_t)ret;
+  }
+
+  content[received] = '\0';
+  cJSON *json = cJSON_Parse(content);
+  if (json == NULL || !cJSON_IsObject(json)) {
+    cJSON_Delete(json);
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                        "Invalid radio JSON");
+    return NULL;
+  }
+
+  return json;
+}
+
+static esp_err_t radio_get_handler(httpd_req_t *req) {
+  cJSON *json = cJSON_CreateObject();
+  cJSON *favorites = cJSON_CreateArray();
+  if (json == NULL || favorites == NULL) {
+    cJSON_Delete(json);
+    cJSON_Delete(favorites);
+    return httpd_resp_send_500(req);
+  }
+
+  cJSON_AddStringToObject(
+      json, "mode",
+      streaming_mode_get() == STREAMING_MODE_RADIO ? "radio" : "airplay");
+
+  size_t selected = 0;
+  if (radio_stations_get_selected(&selected) == ESP_OK) {
+    cJSON_AddNumberToObject(json, "selected", selected);
+  } else {
+    cJSON_AddNullToObject(json, "selected");
+  }
+
+  size_t count = radio_stations_count();
+  for (size_t i = 0; i < count; ++i) {
+    radio_station_t *station = malloc(sizeof(*station));
+    if (station == NULL) {
+      cJSON_Delete(favorites);
+      cJSON_Delete(json);
+      return httpd_resp_send_500(req);
+    }
+
+    esp_err_t err = radio_stations_get(i, station);
+    if (err != ESP_OK) {
+      free(station);
+      cJSON_Delete(favorites);
+      cJSON_Delete(json);
+      return httpd_resp_send_500(req);
+    }
+
+    cJSON *item = cJSON_CreateObject();
+    if (item == NULL) {
+      free(station);
+      cJSON_Delete(favorites);
+      cJSON_Delete(json);
+      return httpd_resp_send_500(req);
+    }
+
+    cJSON_AddStringToObject(item, "name", station->name);
+    cJSON_AddStringToObject(item, "url", station->url);
+    cJSON_AddItemToArray(favorites, item);
+    free(station);
+  }
+
+  cJSON_AddItemToObject(json, "favorites", favorites);
+  char *body = cJSON_PrintUnformatted(json);
+  cJSON_Delete(json);
+
+  if (body == NULL) {
+    return httpd_resp_send_500(req);
+  }
+
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  esp_err_t result = httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
+  free(body);
+  return result;
+}
+
+static esp_err_t radio_post_handler(httpd_req_t *req) {
+  cJSON *json = radio_api_read_json(req);
+  if (json == NULL) {
+    return ESP_FAIL;
+  }
+
+  const cJSON *action = cJSON_GetObjectItemCaseSensitive(json, "action");
+  esp_err_t err = ESP_ERR_INVALID_ARG;
+
+  if (cJSON_IsString(action) &&
+      strcmp(action->valuestring, "add") == 0) {
+    const cJSON *name = cJSON_GetObjectItemCaseSensitive(json, "name");
+    const cJSON *url = cJSON_GetObjectItemCaseSensitive(json, "url");
+
+    if (cJSON_IsString(name) && cJSON_IsString(url) &&
+        name->valuestring != NULL && url->valuestring != NULL &&
+        strlen(name->valuestring) < RADIO_STATION_NAME_MAX &&
+        strlen(url->valuestring) < RADIO_STATION_URL_MAX) {
+      radio_station_t *station = calloc(1, sizeof(*station));
+      if (station == NULL) {
+        err = ESP_ERR_NO_MEM;
+      } else {
+        strcpy(station->name, name->valuestring);
+        strcpy(station->url, url->valuestring);
+        err = radio_stations_add(station);
+        free(station);
+      }
+    }
+  } else if (cJSON_IsString(action) &&
+           strcmp(action->valuestring, "select") == 0) {
+    const cJSON *index =
+        cJSON_GetObjectItemCaseSensitive(json, "index");
+
+    if (cJSON_IsNumber(index) &&
+        index->valuedouble >= 0 &&
+        index->valuedouble < RADIO_MAX_FAVORITES &&
+        index->valuedouble == (double)index->valueint) {
+      err = radio_stations_select((size_t)index->valueint);
+      if (err == ESP_OK &&
+          streaming_mode_get() == STREAMING_MODE_RADIO) {
+        if (!streaming_mode_request_radio_restart()) {
+          ESP_LOGW(TAG, "Radio restart request could not be queued");
+        }
+      }
+    }
+  } else if (cJSON_IsString(action) &&
+           strcmp(action->valuestring, "remove") == 0) {
+    const cJSON *index =
+        cJSON_GetObjectItemCaseSensitive(json, "index");
+
+    if (cJSON_IsNumber(index) &&
+        index->valuedouble >= 0 &&
+        index->valuedouble < RADIO_MAX_FAVORITES &&
+        index->valuedouble == (double)index->valueint) {
+      err = radio_stations_remove((size_t)index->valueint);
+      if (err == ESP_OK &&
+          streaming_mode_get() == STREAMING_MODE_RADIO) {
+        if (!streaming_mode_request_radio_restart()) {
+          ESP_LOGW(TAG, "Radio restart request could not be queued");
+        }
+      }
+    }
+  } else if (cJSON_IsString(action) &&
+           strcmp(action->valuestring, "move") == 0) {
+    const cJSON *from =
+        cJSON_GetObjectItemCaseSensitive(json, "from");
+    const cJSON *to =
+        cJSON_GetObjectItemCaseSensitive(json, "to");
+
+    if (cJSON_IsNumber(from) && cJSON_IsNumber(to) &&
+        from->valuedouble >= 0 &&
+        to->valuedouble >= 0 &&
+        from->valuedouble < RADIO_MAX_FAVORITES &&
+        to->valuedouble < RADIO_MAX_FAVORITES &&
+        from->valuedouble == (double)from->valueint &&
+        to->valuedouble == (double)to->valueint) {
+      err = radio_stations_move((size_t)from->valueint,
+                                (size_t)to->valueint);
+    }
+  }
+
+  cJSON_Delete(json);
+
+  if (err != ESP_OK) {
+    httpd_resp_send_err(
+        req, (err == ESP_ERR_INVALID_ARG || err == ESP_ERR_INVALID_SIZE)
+                 ? HTTPD_400_BAD_REQUEST
+                 : HTTPD_500_INTERNAL_SERVER_ERROR,
+        esp_err_to_name(err));
+    return ESP_FAIL;
+  }
+
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  return httpd_resp_send(req, "{\"success\":true}",
+                         HTTPD_RESP_USE_STRLEN);
 }
 
 static esp_err_t logs_page_handler(httpd_req_t *req) {
@@ -2377,7 +2587,7 @@ esp_err_t web_server_start(uint16_t port) {
   // Slots are allocated up front and httpd_register_uri_handler failures are
   // unchecked, so an undercount silently drops whatever registers last, which
   // is log_stream's /ws/logs. Keep these in step with the handlers below.
-  config.max_uri_handlers = 38; // 32 here + /ws/logs, plus 5 spare
+  config.max_uri_handlers = 40; // 32 here + /ws/logs, plus 5 spare
 #ifdef CONFIG_SENDSPIN_ENABLE
   config.max_uri_handlers += 5; // /sendspin + mode get/post + unpair + reset
   // The Sendspin server holds its WebSocket open for as long as the speaker
@@ -2421,6 +2631,22 @@ esp_err_t web_server_start(uint16_t port) {
   httpd_uri_t favicon_uri = {
       .uri = "/favicon.ico", .method = HTTP_GET, .handler = favicon_handler};
   httpd_register_uri_handler(s_server, &favicon_uri);
+
+  httpd_uri_t radio_uri = {
+      .uri = "/radio", .method = HTTP_GET, .handler = radio_page_handler};
+  httpd_register_uri_handler(s_server, &radio_uri);
+
+  httpd_uri_t radio_get_uri = {
+      .uri = "/api/radio",
+      .method = HTTP_GET,
+      .handler = radio_get_handler};
+  httpd_register_uri_handler(s_server, &radio_get_uri);
+
+  httpd_uri_t radio_post_uri = {
+      .uri = "/api/radio",
+      .method = HTTP_POST,
+      .handler = radio_post_handler};
+  httpd_register_uri_handler(s_server, &radio_post_uri);
 
   httpd_uri_t logs_uri = {
       .uri = "/logs", .method = HTTP_GET, .handler = logs_page_handler};

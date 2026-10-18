@@ -13,5 +13,8 @@ typedef enum {
 // Request a mode change from another FreeRTOS task.
 bool streaming_mode_request_toggle(void);
 
+// Request a radio stream restart after changing the selected station.
+bool streaming_mode_request_radio_restart(void);
+
 // Return the currently selected operating mode.
 streaming_mode_t streaming_mode_get(void);

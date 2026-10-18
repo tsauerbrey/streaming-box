@@ -6,6 +6,7 @@
 #include "buttons.h"
 #include "streaming_mode.h"
 #include "radio/radio_player.h"
+#include "radio/radio_stations.h"
 #include "spiram_task.h"
 #include "display.h"
 #include "dns_server.h"
@@ -73,7 +74,8 @@ typedef enum {
     STREAMING_MODE_CMD_TOGGLE = 1,
     STREAMING_MODE_CMD_NETWORK_UP,
     STREAMING_MODE_CMD_AUDIO_OWNER_ACTIVE,
-    STREAMING_MODE_CMD_AUDIO_OWNER_IDLE
+    STREAMING_MODE_CMD_AUDIO_OWNER_IDLE,
+    STREAMING_MODE_CMD_RADIO_RESTART
 } streaming_mode_command_t;
 
 streaming_mode_t streaming_mode_get(void) {
@@ -88,6 +90,15 @@ bool streaming_mode_request_toggle(void) {
 
     streaming_mode_command_t command = STREAMING_MODE_CMD_TOGGLE;
 
+    return xQueueSend(s_mode_queue, &command, 0) == pdTRUE;
+}
+
+bool streaming_mode_request_radio_restart(void) {
+    if (s_mode_queue == NULL) {
+        return false;
+    }
+
+    streaming_mode_command_t command = STREAMING_MODE_CMD_RADIO_RESTART;
     return xQueueSend(s_mode_queue, &command, 0) == pdTRUE;
 }
 
@@ -204,6 +215,35 @@ static void streaming_mode_task(void *pvParameters) {
 
   while (1) {
     if (xQueueReceive(s_mode_queue, &command, portMAX_DELAY) != pdTRUE) {
+      continue;
+    }
+
+    if (command == STREAMING_MODE_CMD_RADIO_RESTART) {
+      if (s_streaming_mode != STREAMING_MODE_RADIO) {
+        ESP_LOGI(TAG, "Radio restart ignored: AIRPLAY mode active");
+        continue;
+      }
+
+      if (!radio_player_is_running()) {
+        ESP_LOGI(TAG, "Radio restart: player not running");
+        continue;
+      }
+
+      if (!radio_player_stop_and_wait()) {
+        ESP_LOGE(TAG, "Radio restart aborted: audio not released");
+        continue;
+      }
+
+      if (!(ethernet_is_connected() || wifi_is_connected())) {
+        ESP_LOGW(TAG, "Radio restart deferred: network unavailable");
+        continue;
+      }
+
+      esp_err_t err = radio_player_start();
+      if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Radio restart failed: %s",
+                 esp_err_to_name(err));
+      }
       continue;
     }
 
@@ -569,6 +609,12 @@ void app_main(void) {
   }
   ESP_ERROR_CHECK(ret);
   ESP_ERROR_CHECK(settings_init());
+
+  esp_err_t radio_err = radio_stations_init();
+  if (radio_err != ESP_OK) {
+    ESP_LOGE(TAG, "Radio favorites initialization failed: %s",
+             esp_err_to_name(radio_err));
+  }
 #ifdef CONFIG_DAC_TAS57XX
   // Load persisted sub level offset (pre-init safe; applied on first volume).
   float sub_off;

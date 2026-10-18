@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Streaming-Box – Internetradio</title>
+<style>
+*{box-sizing:border-box}
+body{font-family:-apple-system,system-ui,sans-serif;background:linear-gradient(135deg,#1a1a2e,#16213e);min-height:100vh;margin:0;padding:20px;color:#fff}
+.wrap{max-width:480px;margin:auto}
+header{text-align:center;padding:20px 0 28px}
+h1{font-size:26px;margin:0 0 8px}
+header p{color:#aaa;margin:0}
+.card{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:16px;padding:20px;margin-bottom:16px}
+h2{font-size:17px;color:#e94560;margin:0 0 16px}
+input{width:100%;padding:12px;background:rgba(0,0,0,.3);border:1px solid #555;border-radius:8px;color:white;font-size:14px}
+button,.btn{display:inline-block;padding:12px 16px;background:#e94560;border:0;border-radius:8px;color:white;text-decoration:none;font-size:14px;cursor:pointer}
+.btn-secondary{background:rgba(255,255,255,.12)}
+.actions{display:flex;gap:10px;margin-top:12px}
+.muted{color:#aaa;font-size:13px}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+<h1>Streaming-Box</h1>
+<p>Internetradio</p>
+</header>
+
+<div class="card">
+<h2>Aktueller Sender</h2>
+<p id="current-station">Noch kein Sender ausgewählt</p>
+<p class="muted" id="radio-status">Status wird später geladen</p>
+</div>
+
+<div class="card">
+<h2>Sender suchen</h2>
+<input id="station-search" type="search" placeholder="Sendername eingeben">
+<div class="actions">
+<button id="search-button" type="button">Suchen</button>
+</div>
+<div id="search-results"></div>
+</div>
+
+<div class="card">
+<h2>Meine Favoriten (<span id="radio-favorites-count">0 von 20</span>)</h2>
+<div id="radio-favorites" class="muted">Noch keine Favoriten gespeichert</div>
+</div>
+
+<a class="btn btn-secondary" href="/">Zurück zu den Einstellungen</a>
+</div>
+<script>
+async function radioAction(action) {
+  const response = await fetch('/api/radio', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(action)
+  });
+
+  if (!response.ok) {
+    throw new Error('Radio-API: HTTP ' + response.status);
+  }
+
+  await loadRadio();
+}
+
+async function loadRadio() {
+  const status = document.getElementById('radio-status');
+  const favorites = document.getElementById('radio-favorites');
+
+  try {
+    const response = await fetch('/api/radio', {cache: 'no-store'});
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+
+    const data = await response.json();
+    status.textContent = data.mode === 'radio'
+      ? 'Betriebsmodus: Internetradio'
+      : 'Betriebsmodus: AirPlay';
+
+    favorites.replaceChildren();
+
+    const stations = data.favorites;
+    document.getElementById('radio-favorites-count').textContent =
+      stations.length + ' von ' + RADIO_MAX_FAVORITES;
+    const selected = data.selected;
+    const current = document.getElementById('current-station');
+
+    if (stations.length === 0) {
+      favorites.textContent = 'Noch keine Favoriten gespeichert';
+      current.textContent = 'Noch kein Sender ausgewählt';
+    } else {
+      current.textContent = selected !== null && stations[selected]
+        ? stations[selected].name
+        : 'Noch kein Sender ausgewählt';
+
+      stations.forEach((station, index) => {
+        const row = document.createElement('div');
+        row.style.padding = '10px 0';
+        row.style.borderBottom = '1px solid rgba(255,255,255,.1)';
+
+        const name = document.createElement('div');
+        name.textContent =
+          (index === selected ? '▶ ' : '') + station.name;
+        row.appendChild(name);
+
+        const play = document.createElement('button');
+        play.type = 'button';
+        play.textContent = 'Abspielen';
+        play.style.marginTop = '8px';
+
+        play.addEventListener('click', async () => {
+          play.disabled = true;
+          try {
+            await radioAction({action: 'select', index});
+          } catch (error) {
+            alert('Senderwechsel fehlgeschlagen: ' + error.message);
+            play.disabled = false;
+          }
+        });
+
+        row.appendChild(play);
+
+        const remove = document.createElement('button');
+        remove.type = 'button';
+        remove.textContent = 'Löschen';
+        remove.className = 'btn-secondary';
+        remove.style.margin = '8px 0 0 8px';
+
+        remove.addEventListener('click', async () => {
+          if (!confirm('Favorit "' + station.name + '" löschen?')) {
+            return;
+          }
+
+          remove.disabled = true;
+          try {
+            await radioAction({action: 'remove', index});
+          } catch (error) {
+            alert('Löschen fehlgeschlagen: ' + error.message);
+            remove.disabled = false;
+          }
+        });
+
+        row.appendChild(remove);
+
+        if (index > 0) {
+          const up = document.createElement('button');
+          up.type = 'button';
+          up.textContent = '↑ Nach oben';
+          up.className = 'btn-secondary';
+          up.style.margin = '8px 0 0 8px';
+
+          up.addEventListener('click', async () => {
+            up.disabled = true;
+            try {
+              await radioAction({
+                action: 'move',
+                from: index,
+                to: index - 1
+              });
+            } catch (error) {
+              alert('Verschieben fehlgeschlagen: ' + error.message);
+              up.disabled = false;
+            }
+          });
+
+          row.appendChild(up);
+        }
+
+        if (index < stations.length - 1) {
+          const down = document.createElement('button');
+          down.type = 'button';
+          down.textContent = '↓ Nach unten';
+          down.className = 'btn-secondary';
+          down.style.margin = '8px 0 0 8px';
+
+          down.addEventListener('click', async () => {
+            down.disabled = true;
+            try {
+              await radioAction({
+                action: 'move',
+                from: index,
+                to: index + 1
+              });
+            } catch (error) {
+              alert('Verschieben fehlgeschlagen: ' + error.message);
+              down.disabled = false;
+            }
+          });
+
+          row.appendChild(down);
+        }
+
+        favorites.appendChild(row);
+      });
+    }
+  } catch (error) {
+    status.textContent = 'Radio-Daten konnten nicht geladen werden';
+    favorites.textContent = error.message;
+  }
+}
+
+const RADIO_MAX_FAVORITES = 20;
+
+function utf8Length(value) {
+  return new TextEncoder().encode(value).length;
+}
+
+async function searchStations() {
+  const input = document.getElementById('station-search');
+  const results = document.getElementById('search-results');
+  const query = input.value.trim();
+
+  if (query.length < 2) {
+    results.textContent = 'Bitte mindestens zwei Zeichen eingeben.';
+    return;
+  }
+
+  results.textContent = 'Sender werden gesucht ...';
+
+  try {
+    const url = 'https:' + '/' + '/' + 'de1.api.radio-browser.info/json/stations/search'
+      + '?name=' + encodeURIComponent(query)
+      + '&limit=30&hidebroken=true&order=clickcount&reverse=true';
+
+    const response = await fetch(url);
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+
+    const stations = await response.json();
+    results.replaceChildren();
+
+    const mp3Stations = stations.filter(station =>
+      station.codec &&
+      station.codec.toUpperCase() === 'MP3' &&
+      typeof station.name === 'string' &&
+      station.name.trim().length > 0 &&
+      utf8Length(station.name.trim()) < 96 &&
+      station.url_resolved &&
+      utf8Length(station.url_resolved) < 512 &&
+      /^https?:\/\//i.test(station.url_resolved)
+    );
+
+    if (mp3Stations.length === 0) {
+      results.textContent = 'Keine passenden MP3-Sender gefunden';
+      return;
+    }
+
+    mp3Stations.forEach(station => {
+      const row = document.createElement('div');
+      row.style.padding = '12px 0';
+      row.style.borderBottom = '1px solid rgba(255,255,255,.1)';
+
+      const name = document.createElement('div');
+      name.textContent = station.name;
+      row.appendChild(name);
+
+      const url = document.createElement('div');
+      url.className = 'muted';
+      url.style.overflowWrap = 'anywhere';
+      url.textContent = station.url_resolved;
+      row.appendChild(url);
+
+      const add = document.createElement('button');
+      add.type = 'button';
+      add.textContent = 'Als Favorit speichern';
+      add.style.marginTop = '8px';
+
+      add.addEventListener('click', async () => {
+        const countText =
+          document.getElementById('radio-favorites-count').textContent;
+        const favoriteCount = Number.parseInt(countText, 10);
+
+        if (favoriteCount >= RADIO_MAX_FAVORITES) {
+          alert('Die Favoritenliste ist voll (maximal 20 Sender).');
+          return;
+        }
+
+        add.disabled = true;
+        try {
+          await radioAction({
+            action: 'add',
+            name: station.name.trim(),
+            url: station.url_resolved
+          });
+          add.textContent = 'Gespeichert';
+        } catch (error) {
+          alert('Speichern fehlgeschlagen: ' + error.message);
+          add.disabled = false;
+        }
+      });
+
+      row.appendChild(add);
+      results.appendChild(row);
+    });
+  } catch (error) {
+    results.textContent =
+      'Sendersuche derzeit nicht verfügbar: ' + error.message;
+  }
+}
+
+document.getElementById('search-button')
+  .addEventListener('click', searchStations);
+
+loadRadio();
+</script>
+</body>
+</html>
