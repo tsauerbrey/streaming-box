@@ -1527,94 +1527,11 @@ static void set_power_mode_dev(tas58xx_dev_t *dev, dac_power_mode_t mode) {
      * read back from the dump at load, so pushing it here restores that
      * tuning — or the user's edit of it.
      */
-    /* TEMPORARY DSP TEST: write custom coefficients without activating them. */
-    if (dev->model == TAS58XX_MODEL_TAS5825M) {
-      esp_err_t dsp_err = write_dsp_signal_path_defaults();
-      ESP_LOGW(TAG, "DSP TEST: coefficient loading result: %s",
-               esp_err_to_name(dsp_err));
+    /* Diagnostic build: leave the chip on its stock DSP coefficients.
+     * Do not write custom DSP coefficient RAM or switch DSP_CTRL to 0.
+     * This isolates I2S, PBTL, power sequencing, and amplifier faults. */
+    ESP_LOGW(TAG, "DIAGNOSTIC: stock DSP coefficients retained; custom DSP skipped");
 
-      if (dsp_err == ESP_OK) {
-        const uint8_t muted_play = CTRL2_PLAY | CTRL2_MUTE;
-        esp_err_t err = tas58xx_write_reg(REG_DEVICE_CTRL2, muted_play);
-        bool mute_confirmed = false;
-
-        if (err == ESP_OK) {
-          uint8_t ctrl2_verify = 0xFF;
-          err = tas58xx_read_reg(REG_DEVICE_CTRL2, &ctrl2_verify);
-
-          if (err == ESP_OK && !(ctrl2_verify & CTRL2_MUTE)) {
-            ESP_LOGE(TAG,
-                     "DSP TEST: mute verification failed: CTRL2=0x%02X",
-                     ctrl2_verify);
-            err = ESP_ERR_INVALID_STATE;
-          }
-          mute_confirmed = (err == ESP_OK);
-        }
-
-        if (err == ESP_OK) {
-          vTaskDelay(pdMS_TO_TICKS(10));
-          err = tas58xx_write_reg(REG_DSP_CTRL, 0x00);
-        }
-
-        uint8_t verify = 0xFF;
-        if (err == ESP_OK) {
-          err = tas58xx_read_reg(REG_DSP_CTRL, &verify);
-        }
-
-        ESP_LOGW(TAG, "DSP TEST: switch result=%s DSP_CTRL=0x%02X",
-                 esp_err_to_name(err), verify);
-
-        bool safe_to_unmute = (err == ESP_OK && verify == 0x00);
-
-        if (!safe_to_unmute && mute_confirmed) {
-          ESP_LOGE(TAG, "DSP TEST: switch failed, restoring defaults");
-
-          esp_err_t restore_err =
-              tas58xx_write_reg(REG_DSP_CTRL, 0x01);
-          uint8_t restored = 0xFF;
-
-          if (restore_err == ESP_OK) {
-            restore_err = tas58xx_read_reg(REG_DSP_CTRL, &restored);
-          }
-
-          safe_to_unmute =
-              (restore_err == ESP_OK && (restored & 0x01));
-
-          ESP_LOGW(TAG,
-                   "DSP TEST: restore result=%s DSP_CTRL=0x%02X",
-                   esp_err_to_name(restore_err), restored);
-        }
-
-        if (safe_to_unmute && mute_confirmed && verify == 0x00) {
-          esp_err_t mix_err = tas58xx_apply_input_mix();
-          ESP_LOGW(TAG, "DSP TEST: mixer result=%s",
-                   esp_err_to_name(mix_err));
-          if (mix_err != ESP_OK) {
-            safe_to_unmute = false;
-          } else {
-            esp_err_t eq_err = write_eq_mode(true);
-            ESP_LOGW(TAG, "DSP TEST: neutral EQ enable result=%s",
-                     esp_err_to_name(eq_err));
-            if (eq_err != ESP_OK) {
-              safe_to_unmute = false;
-            }
-          }
-        }
-
-        if (safe_to_unmute && mute_confirmed) {
-          vTaskDelay(pdMS_TO_TICKS(10));
-          esp_err_t unmute_err =
-              tas58xx_write_reg(REG_DEVICE_CTRL2, CTRL2_PLAY);
-
-          ESP_LOGW(TAG, "DSP TEST: unmute result=%s",
-                   esp_err_to_name(unmute_err));
-        } else {
-          ESP_LOGE(TAG,
-                   "DSP TEST: unsafe DSP state, playback not released");
-        }
-      }
-    }
-    ESP_LOGW(TAG, "DSP TEST: custom mixer and EQ skipped");
 
     tas58xx_dump_status("power-on");
   } else if (mode == DAC_POWER_STANDBY) {
