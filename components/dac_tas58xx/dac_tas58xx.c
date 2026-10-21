@@ -3484,5 +3484,6 @@ static void tas58xx_on_i2s_started(uint32_t sample_rate_hz) {
   s_bq_fs = (double)sample_rate_hz;
 
   tas58xx_reload_hf_for_rate();
-  bq_reprogram_all();
+  /* DIAGNOSTIC: retain stock DSP coefficients on sample-rate changes. */
+  /* bq_reprogram_all(); */
 }
