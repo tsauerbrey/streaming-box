@@ -297,6 +297,165 @@ static bool radio_is_redirect(int status)
            status == 307 ||
            status == 308;
 }
+typedef struct {
+    size_t metaint;
+    size_t audio_remaining;
+    size_t metadata_remaining;
+    size_t metadata_received;
+    bool metadata_length_pending;
+    char metadata[4081];
+} radio_icy_state_t;
+
+static esp_err_t radio_http_event_handler(esp_http_client_event_t *evt)
+{
+    if (evt->event_id == HTTP_EVENT_ON_HEADER &&
+        evt->header_key != NULL &&
+        evt->header_value != NULL) {
+
+        if (strncasecmp(evt->header_key, "icy-", 4) == 0) {
+            ESP_LOGI(TAG, "ICY header: %s=%s",
+                     evt->header_key, evt->header_value);
+        }
+
+        if (strcasecmp(evt->header_key, "icy-metaint") == 0 &&
+            evt->user_data != NULL) {
+            radio_icy_state_t *icy = evt->user_data;
+            char *end = NULL;
+            unsigned long interval = strtoul(evt->header_value, &end, 10);
+
+            if (end != evt->header_value &&
+                *end == '\0' &&
+                interval > 0 &&
+                interval <= 1048576UL) {
+                icy->metaint = (size_t)interval;
+                icy->audio_remaining = icy->metaint;
+                ESP_LOGI(TAG, "ICY metadata interval: %u bytes",
+                         (unsigned)icy->metaint);
+            }
+        }
+    }
+
+    return ESP_OK;
+}
+
+static void radio_emit_icy_metadata(const char *metadata)
+{
+    const char *start = strstr(metadata, "StreamTitle='");
+    if (!start) return;
+
+    start += strlen("StreamTitle='");
+
+    // ICY-Felder enden mit ';', nicht mit dem ersten Apostroph
+    // innerhalb eines Titels.
+    const char *end = strstr(start, "';");
+    if (!end || end == start) return;
+
+    char text[256];
+    size_t length = (size_t)(end - start);
+    if (length >= sizeof(text)) length = sizeof(text) - 1;
+    memcpy(text, start, length);
+    text[length] = '\0';
+
+    playback_event_data_t event = {0};
+
+    // Manche Sender verwenden "Interpret - Titel".
+    // SWR3 liefert auch "Titel / Interpret".
+    char *separator = strstr(text, " / ");
+    if (separator) {
+        *separator = '\0';
+        snprintf(event.metadata.title, METADATA_STRING_MAX,
+                 "%s", text);
+        snprintf(event.metadata.artist, METADATA_STRING_MAX,
+                 "%s", separator + 3);
+    } else {
+        separator = strstr(text, " - ");
+        if (separator) {
+            *separator = '\0';
+            snprintf(event.metadata.artist, METADATA_STRING_MAX,
+                     "%s", text);
+            snprintf(event.metadata.title, METADATA_STRING_MAX,
+                     "%s", separator + 3);
+        } else {
+            snprintf(event.metadata.title, METADATA_STRING_MAX,
+                     "%s", text);
+        }
+    }
+
+    playback_events_emit(PLAYBACK_SOURCE_RADIO,
+                         PLAYBACK_EVENT_METADATA, &event);
+
+    ESP_LOGI(TAG, "ICY display: title='%s', artist='%s'",
+             event.metadata.title, event.metadata.artist);
+}
+
+static esp_err_t radio_process_icy_data(
+    radio_ctx_t *ctx,
+    radio_icy_state_t *icy,
+    const uint8_t *data,
+    size_t length)
+{
+    if (icy->metaint == 0) {
+        return radio_process_data(ctx, data, length);
+    }
+
+    size_t offset = 0;
+
+    while (offset < length) {
+        if (icy->audio_remaining > 0) {
+            size_t count = length - offset;
+            if (count > icy->audio_remaining) {
+                count = icy->audio_remaining;
+            }
+
+            esp_err_t err = radio_process_data(ctx, data + offset, count);
+            if (err != ESP_OK) {
+                return err;
+            }
+
+            offset += count;
+            icy->audio_remaining -= count;
+            if (icy->audio_remaining == 0) {
+                icy->metadata_length_pending = true;
+            }
+            continue;
+        }
+
+        if (icy->metadata_length_pending) {
+            icy->metadata_length_pending = false;
+            icy->metadata_remaining = (size_t)data[offset++] * 16U;
+
+            if (icy->metadata_remaining == 0) {
+                icy->audio_remaining = icy->metaint;
+            }
+            continue;
+        }
+
+        size_t count = length - offset;
+        if (count > icy->metadata_remaining) {
+            count = icy->metadata_remaining;
+        }
+
+        memcpy(icy->metadata + icy->metadata_received,
+               data + offset, count);
+
+        icy->metadata_received += count;
+        icy->metadata_remaining -= count;
+        offset += count;
+
+        if (icy->metadata_remaining == 0) {
+            icy->metadata[icy->metadata_received] = '\0';
+
+            ESP_LOGI(TAG, "ICY metadata: %s", icy->metadata);
+            radio_emit_icy_metadata(icy->metadata);
+
+            icy->metadata_received = 0;
+            icy->audio_remaining = icy->metaint;
+        }
+    }
+
+    return ESP_OK;
+}
+
 static void radio_task(void *arg)
 {
     (void)arg;
@@ -361,12 +520,15 @@ static void radio_task(void *arg)
             break;
         }
 
+        radio_icy_state_t icy = {0};
         esp_http_client_config_t config = {
 		    .url = stream_url,
 		    .timeout_ms = HTTP_TIMEOUT_MS,
 		    .buffer_size = RADIO_HTTP_READ_BUFFER_SIZE,
 		    .disable_auto_redirect = true,
 		    .crt_bundle_attach = esp_crt_bundle_attach,
+            .event_handler = radio_http_event_handler,
+            .user_data = &icy,
 		};
 
         esp_http_client_handle_t client = esp_http_client_init(&config);
@@ -376,10 +538,11 @@ static void radio_task(void *arg)
         }
 		int redirect_count = 0;
 		int http_status = 0;
-        esp_http_client_set_header(client, "Icy-MetaData", "0");
+        esp_http_client_set_header(client, "Icy-MetaData", "1");
         ESP_LOGI(TAG, "Opening radio stream: %s", stream_url);
 
         while (!atomic_load(&s_stop_requested)) {
+            memset(&icy, 0, sizeof(icy));
             result = esp_http_client_open(client, 0);
             if (result != ESP_OK) {
                 break;
@@ -462,8 +625,8 @@ static void radio_task(void *arg)
                 );
 
                 if (bytes_read > 0) {
-                    result = radio_process_data(
-                        &c, http_buffer, (size_t)bytes_read
+                    result = radio_process_icy_data(
+                        &c, &icy, http_buffer, (size_t)bytes_read
                     );
 
                     if (result != ESP_OK) {
@@ -548,7 +711,7 @@ esp_err_t radio_player_start(void)
     atomic_store(&s_stop_requested, false);
     atomic_store(&s_audio_released, false);
     TaskHandle_t task = NULL;
-    BaseType_t ok = xTaskCreate(radio_task, "radio_player", 8192, NULL, 5, &task);
+    BaseType_t ok = xTaskCreate(radio_task, "radio_player", 16384, NULL, 5, &task);
     if (ok != pdPASS) {
         atomic_store(&s_audio_released, true);
         xSemaphoreGive(s_lifecycle_mutex);
