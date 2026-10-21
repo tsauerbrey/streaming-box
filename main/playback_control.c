@@ -314,6 +314,20 @@ void playback_control_set_muted(bool muted) {
   }
 }
 
+void playback_control_power_unmute(void) {
+  const float target_db = -20.0f;
+
+  // Update the saved level and clear local mute.
+  // Drive the DAC explicitly because settings_set_volume() skips
+  // unchanged values, even if the DAC is currently muted.
+  s_muted = false;
+  s_pre_mute_db = target_db;
+  settings_set_volume(target_db);
+  dac_set_volume(target_db);
+
+  ESP_LOGI(TAG, "POWER: local mute cleared, volume %.1f dB", target_db);
+}
+
 void playback_control_set_volume_percent(int percent) {
   const float db = clamp_volume(dacp_percent_to_db((float)percent));
   apply_level(db);

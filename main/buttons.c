@@ -22,6 +22,7 @@
 
 #include "buttons.h"
 #include "audio_output.h"
+#include "display.h"
 #include "playback_control.h"
 #include "spiram_task.h"
 
@@ -67,6 +68,7 @@ typedef enum {
   BTN_CHANNEL_CYCLE,
   BTN_RADIO_NEXT,
   BTN_RADIO_PREV,
+  BTN_IR_POWER,
   BTN_COUNT
 } button_id_t;
 
@@ -99,6 +101,9 @@ bool buttons_post_ir_command(uint8_t command) {
   button_id_t action;
 
   switch (command) {
+  case 0x9C: // POWER
+    action = BTN_IR_POWER;
+    break;
   case 0x80: // VOL+
     action = BTN_VOLUME_UP;
     break;
@@ -238,6 +243,17 @@ static void button_action_task(void *pvParameters) {
         }
         break;
       }
+      case BTN_IR_POWER:
+        if (playback_control_is_muted()) {
+          playback_control_power_unmute();
+          display_set_clock_mode(false);
+          ESP_LOGI(TAG, "IR POWER: audio on (-20.0 dB), clock off");
+        } else {
+          playback_control_set_muted(true);
+          display_set_clock_mode(true);
+          ESP_LOGI(TAG, "IR POWER: audio muted, clock on");
+        }
+        break;
       case BTN_CHANNEL_CYCLE:
         audio_output_cycle_channel_mode();
         break;

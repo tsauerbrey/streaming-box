@@ -4,6 +4,7 @@
 #pragma once
 
 #include "sdkconfig.h"
+#include <stdbool.h>
 
 /**
  * OLED display module - Shows track metadata, playback position &
@@ -27,10 +28,17 @@
  */
 void display_init(void *bus);
 
+/** Show or hide the centered system clock. */
+void display_set_clock_mode(bool enabled);
+
 #else
 
 static inline void display_init(void *bus) {
   (void)bus;
+}
+
+static inline void display_set_clock_mode(bool enabled) {
+  (void)enabled;
 }
 
 #endif

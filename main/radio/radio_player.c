@@ -78,6 +78,31 @@ static bool grow_input(radio_ctx_t *c, size_t need)
     return true;
 }
 
+static void radio_emit_station_name(void)
+{
+    size_t station_index = 0;
+    if (radio_stations_get_selected(&station_index) != ESP_OK) {
+        return;
+    }
+
+    radio_station_t *station = malloc(sizeof(*station));
+    if (station == NULL) {
+        return;
+    }
+
+    if (radio_stations_get(station_index, station) == ESP_OK) {
+        playback_event_data_t station_event = {0};
+        snprintf(station_event.metadata.album,
+                 METADATA_STRING_MAX, "%s", station->name);
+        playback_events_emit(PLAYBACK_SOURCE_RADIO,
+                             PLAYBACK_EVENT_METADATA,
+                             &station_event);
+        ESP_LOGI(TAG, "OLED radio station: %s", station->name);
+    }
+
+    free(station);
+}
+
 static bool write_pcm(radio_ctx_t *c, const esp_audio_dec_info_t *info,
                       uint32_t bytes)
 {
@@ -110,6 +135,7 @@ static bool write_pcm(radio_ctx_t *c, const esp_audio_dec_info_t *info,
         playback_events_emit(PLAYBACK_SOURCE_RADIO,
                              PLAYBACK_EVENT_PLAYING, NULL);
         c->playback_started = true;
+        radio_emit_station_name();
     }
     if (info->channel == 2) {
         static unsigned pcm_diag_blocks = 0;

@@ -72,6 +72,12 @@ void playback_control_toggle_mute(void);
 void playback_control_set_muted(bool muted);
 
 /**
+ * Clear local mute and set the DAC to exactly -20.0 dB.
+ * Does not pause, stop or restart the audio stream.
+ */
+void playback_control_power_unmute(void);
+
+/**
  * Set the volume as a percentage (0..100). Always adjusts the local DAC: the
  * sources that call this carry an absolute volume of their own, rather than
  * the relative steps the buttons send.

@@ -51,11 +51,27 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_netif_sntp.h"
+#include "esp_sntp.h"
+#include <stdlib.h>
+#include <time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
 
 static const char *TAG = "main";
+
+static void on_system_time_sync(struct timeval *tv) {
+  (void)tv;
+  time_t now;
+  time(&now);
+  struct tm local_time;
+  localtime_r(&now, &local_time);
+  char time_string[32];
+  strftime(time_string, sizeof(time_string),
+           "%Y-%m-%d %H:%M:%S %Z", &local_time);
+  ESP_LOGI(TAG, "System clock synchronized: %s", time_string);
+}
 
 // AP mode IP address (192.168.4.1 in network byte order)
 #define AP_IP_ADDR 0x0104A8C0
@@ -730,6 +746,23 @@ void app_main(void) {
     ESP_LOGI(TAG, "Ethernet connected — skipping WiFi");
   }
   log_dram("eth+wifi");
+
+  // System clock for the OLED: CET/CEST with automatic DST changes.
+  setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);
+  tzset();
+
+  esp_sntp_config_t time_config =
+      ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+
+  time_config.sync_cb = on_system_time_sync;
+
+  esp_err_t time_err = esp_netif_sntp_init(&time_config);
+  if (time_err != ESP_OK) {
+    ESP_LOGW(TAG, "System clock SNTP init failed: %s",
+             esp_err_to_name(time_err));
+  } else {
+    ESP_LOGI(TAG, "System clock SNTP initialized (CET/CEST)");
+  }
 
   // Start services that work on any interface
 #ifdef CONFIG_SENDSPIN_ENABLE

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "display.h"
+#include <time.h>
 #include "playback_events.h"
 
 #include "u8g2.h"
@@ -42,6 +43,7 @@ static struct {
   uint32_t position_secs;
   display_state_t state;
   bool dirty;           // set by event callback, cleared by render
+  bool clock_mode;      // show centered clock instead of metadata
   int64_t sync_time_us; // esp_timer_get_time() when position was last synced
 } s_display;
 
@@ -54,6 +56,7 @@ typedef struct {
   uint32_t duration_secs;
   uint32_t position_secs;
   display_state_t state;
+  bool clock_mode;
 } display_snapshot_t;
 
 // Scroll configuration. The interval is picked so the step lands on a whole
@@ -287,11 +290,40 @@ static void display_render(void) {
   snap.duration_secs = s_display.duration_secs;
   snap.position_secs = estimated_position_locked();
   snap.state = s_display.state;
+  snap.clock_mode = s_display.clock_mode;
   taskEXIT_CRITICAL(&s_display_mux);
 
   u8g2_ClearBuffer(&s_u8g2);
   s_scroll.active = false;
   scroll_tick();
+
+  if (snap.clock_mode) {
+    char clock_text[6] = "--:--";
+    time_t now = time(NULL);
+    struct tm local_time;
+
+    if (localtime_r(&now, &local_time) != NULL &&
+        local_time.tm_year >= (2024 - 1900)) {
+      strftime(clock_text, sizeof(clock_text), "%H:%M", &local_time);
+    }
+
+    u8g2_SetFont(&s_u8g2, u8g2_font_helvB24_tn);
+
+    int width = u8g2_GetDisplayWidth(&s_u8g2);
+    int height = u8g2_GetDisplayHeight(&s_u8g2);
+    int text_width = u8g2_GetUTF8Width(&s_u8g2, clock_text);
+    int baseline = (height +
+                    u8g2_GetAscent(&s_u8g2) +
+                    u8g2_GetDescent(&s_u8g2)) / 2;
+
+    u8g2_DrawUTF8(&s_u8g2,
+                  (width - text_width) / 2,
+                  baseline,
+                  clock_text);
+
+    send_dirty_rows();
+    return;
+  }
 
   switch (snap.state) {
   case DISPLAY_STATE_STANDBY:
@@ -479,6 +511,20 @@ static void display_task(void *pvParameters) {
 
   while (1) {
     bool is_playing = (s_display.state == DISPLAY_STATE_PLAYING);
+    bool clock_mode;
+
+    taskENTER_CRITICAL(&s_display_mux);
+    clock_mode = s_display.clock_mode;
+    taskEXIT_CRITICAL(&s_display_mux);
+
+    if (clock_mode) {
+      vTaskDelay(one_sec);
+      last_wake = xTaskGetTickCount();
+      s_display.dirty = false;
+      display_render();
+      continue;
+    }
+
     if (s_scroll.active) {
       // A plain delay would add each render to the frame period, tying the
       // scroll speed to I2C timing rather than to the clock.
@@ -508,6 +554,17 @@ static void display_task(void *pvParameters) {
       display_render();
     }
   }
+}
+
+// ============================================================================
+// Clock display mode
+// ============================================================================
+
+void display_set_clock_mode(bool enabled) {
+  taskENTER_CRITICAL(&s_display_mux);
+  s_display.clock_mode = enabled;
+  s_display.dirty = true;
+  taskEXIT_CRITICAL(&s_display_mux);
 }
 
 // ============================================================================
