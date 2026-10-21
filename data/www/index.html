@@ -51,13 +51,11 @@ input:focus{outline:none;border-color:#e94560}
 <div class='wrap'>
 <div class='header'><h1>AirPlay Receiver</h1><p>ESP32 Configuration Panel</p></div>
 <div id='status-bar' class='status-bar'>Loading...</div>
-<div class='card'><h2>WiFi Network</h2>
-<button class='btn btn-secondary' onclick='scanWiFi()'>Scan Networks</button>
-<div id='wifi-list' class='wifi-list'></div>
-<div class='form-group'><label>Network Name (SSID)</label><input type='text' id='wifi-ssid' placeholder='Enter or select network'></div>
-<div class='form-group'><label>Password</label><input type='password' id='wifi-pass' placeholder='Enter password'></div>
-<button class='btn btn-primary btn-block' onclick='saveWiFi()'>Connect to WiFi</button>
-<div id='wifi-msg'></div></div>
+<div class='card'><h2>Internetradio</h2>
+<p style='color:#aaa;font-size:13px;margin-bottom:12px'>Sender suchen, Favoriten verwalten und Internetradio steuern.</p>
+<a href='/radio' class='btn btn-primary'>Radioverwaltung öffnen</a>
+</div>
+
 <div class='card'><h2>Device Settings</h2>
 <div class='form-group'><label>AirPlay Device Name</label><input type='text' id='dev-name' placeholder='My Speaker'></div>
 <button class='btn btn-primary' onclick='saveName()'>Save Name</button>
@@ -111,11 +109,13 @@ input:focus{outline:none;border-color:#e94560}
 <div id='hf1-link' style='display:none;margin-top:18px'>
 <a href='/hf' class='btn btn-secondary'>HybridFlow Tuning</a></div>
 </div>
-<div class='card'><h2>Internetradio</h2>
-<p style='color:#aaa;font-size:13px;margin-bottom:12px'>Sender suchen, Favoriten verwalten und Internetradio steuern.</p>
-<a href='/radio' class='btn btn-primary'>Radioverwaltung öffnen</a>
-</div>
-
+<div class='card'><h2>WiFi Network</h2>
+<button class='btn btn-secondary' onclick='scanWiFi()'>Scan Networks</button>
+<div id='wifi-list' class='wifi-list'></div>
+<div class='form-group'><label>Network Name (SSID)</label><input type='text' id='wifi-ssid' placeholder='Enter or select network'></div>
+<div class='form-group'><label>Password</label><input type='password' id='wifi-pass' placeholder='Enter password'></div>
+<button class='btn btn-primary btn-block' onclick='saveWiFi()'>Connect to WiFi</button>
+<div id='wifi-msg'></div></div>
 <div class='card'><h2>Firmware Update</h2>
 <div class='file-row'><input type='file' id='fw-file' accept='.bin' style='display:none'>
 <button class='btn btn-secondary' onclick='document.getElementById("fw-file").click()'>Choose File</button>
