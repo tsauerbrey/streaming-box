@@ -165,6 +165,11 @@ static esp_err_t decode_buffer(radio_ctx_t *c)
 {
     size_t offset = 0;
     while (offset < c->input_len && !atomic_load(&s_stop_requested)) {
+        // Diagnostic test: wait for more MP3 input before decoding.
+        if (c->input_len - offset < RADIO_HTTP_READ_BUFFER_SIZE) {
+            break;
+        }
+
         esp_audio_dec_in_raw_t raw = {
             .buffer = c->input + offset,
             .len = (uint32_t)(c->input_len - offset),
@@ -197,8 +202,22 @@ static esp_err_t decode_buffer(radio_ctx_t *c)
         } else if (r == ESP_AUDIO_ERR_DATA_LACK) {
             break; // Keep the partial frame until the next HTTP chunk.
         } else {
+            // Diagnostic only: retain the existing error recovery behavior.
+            static unsigned mp3_diag_errors = 0;
+            size_t skipped = raw.consumed ? raw.consumed : 1;
+
+            if (mp3_diag_errors < 30) {
+                ESP_LOGW(TAG,
+                         "MP3 DIAG: result=%d consumed=%lu available=%lu skipped=%lu",
+                         (int)r,
+                         (unsigned long)raw.consumed,
+                         (unsigned long)raw.len,
+                         (unsigned long)skipped);
+                mp3_diag_errors++;
+            }
+
             // Skip damaged data one byte at a time to find the next MP3 frame.
-            offset += raw.consumed ? raw.consumed : 1;
+            offset += skipped;
         }
     }
     if (offset) {
@@ -400,6 +419,13 @@ static esp_err_t radio_process_icy_data(
 
     size_t offset = 0;
 
+    size_t audio_length = 0;
+    uint8_t audio_buffer[RADIO_HTTP_READ_BUFFER_SIZE];
+
+    if (length > sizeof(audio_buffer)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
     while (offset < length) {
         if (icy->audio_remaining > 0) {
             size_t count = length - offset;
@@ -407,10 +433,9 @@ static esp_err_t radio_process_icy_data(
                 count = icy->audio_remaining;
             }
 
-            esp_err_t err = radio_process_data(ctx, data + offset, count);
-            if (err != ESP_OK) {
-                return err;
-            }
+            memcpy(audio_buffer + audio_length,
+                   data + offset, count);
+            audio_length += count;
 
             offset += count;
             icy->audio_remaining -= count;
@@ -453,7 +478,7 @@ static esp_err_t radio_process_icy_data(
         }
     }
 
-    return ESP_OK;
+    return radio_process_data(ctx, audio_buffer, audio_length);
 }
 
 static void radio_task(void *arg)
