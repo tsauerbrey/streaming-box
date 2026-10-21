@@ -93,6 +93,32 @@ static void post_button_action(button_id_t id) {
   xQueueSend(s_action_queue, &action, 0);
 }
 
+bool buttons_post_ir_command(uint8_t command) {
+  button_id_t action;
+
+  switch (command) {
+  case 0x80: // VOL+
+    action = BTN_VOLUME_UP;
+    break;
+  case 0x81: // VOL-
+    action = BTN_VOLUME_DOWN;
+    break;
+  case 0x9D: // MENU
+    action = BTN_LONG_PRESS;
+    break;
+  default:
+    return false;
+  }
+
+  if (s_action_queue == NULL) {
+    ESP_LOGW(TAG, "IR: button action queue not initialized");
+    return false;
+  }
+
+  int queued_action = (int)action;
+  return xQueueSend(s_action_queue, &queued_action, 0) == pdTRUE;
+}
+
 #if BTN_ROTARY_ENABLED
 static void IRAM_ATTR post_button_action_from_isr(button_id_t id,
                                                   BaseType_t *woken) {

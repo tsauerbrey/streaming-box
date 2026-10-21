@@ -46,6 +46,7 @@ set( SRC_FILES
     "network/log_stream.c"
     "led.c"
     "buttons.c"
+    "ir_remote.c"
     "playback_control.c"
     "playback_events.c"
     "dacp_client.c"
@@ -110,6 +111,7 @@ set( DEPS
     esp_event
     esp_ringbuf
     esp_driver_i2s
+    esp_driver_rmt
     esp_timer
     esp_http_server
     esp_http_client

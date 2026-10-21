@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <stdbool.h>
+#include <stdint.h>
+
 #include "esp_err.h"
 
 /**
@@ -21,3 +24,9 @@
  * Must be called after playback_control_init().
  */
 esp_err_t buttons_init(void);
+
+/**
+ * Queue a decoded NEC infrared remote command.
+ * Returns true if the command was accepted for processing.
+ */
+bool buttons_post_ir_command(uint8_t command);

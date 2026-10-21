@@ -4,6 +4,7 @@
 #include "audio_output.h"
 #include "audio_receiver.h"
 #include "buttons.h"
+#include "ir_remote.h"
 #include "streaming_mode.h"
 #include "radio/radio_player.h"
 #include "radio/radio_stations.h"
@@ -828,6 +829,13 @@ void app_main(void) {
   }
   
   ESP_ERROR_CHECK(buttons_init());
+
+  // IR receiver diagnostic mode: GPIO 7, logging only.
+  esp_err_t ir_err = ir_remote_init();
+  if (ir_err != ESP_OK) {
+    ESP_LOGW(TAG, "IR receiver initialization failed: %s",
+             esp_err_to_name(ir_err));
+  }
 
   while (1) {
     vTaskDelay(pdMS_TO_TICKS(10000));
