@@ -65,6 +65,8 @@ typedef enum {
   BTN_LONG_PRESS,
   // Actions below are dispatched directly (not 1:1 with a GPIO button)
   BTN_CHANNEL_CYCLE,
+  BTN_RADIO_NEXT,
+  BTN_RADIO_PREV,
   BTN_COUNT
 } button_id_t;
 
@@ -105,6 +107,12 @@ bool buttons_post_ir_command(uint8_t command) {
     break;
   case 0x9D: // MENU
     action = BTN_LONG_PRESS;
+    break;
+  case 0xC1: // RIGHT
+    action = BTN_RADIO_NEXT;
+    break;
+  case 0x99: // LEFT
+    action = BTN_RADIO_PREV;
     break;
   default:
     return false;
@@ -191,6 +199,45 @@ static void button_action_task(void *pvParameters) {
           ESP_LOGW(TAG, "Streaming-Box: mode switch request failed");
         }
         break;
+      case BTN_RADIO_NEXT:
+      case BTN_RADIO_PREV: {
+        if (streaming_mode_get() != STREAMING_MODE_RADIO) {
+          break;
+        }
+
+        size_t count = radio_stations_count();
+        if (count == 0) {
+          ESP_LOGW(TAG, "IR: no radio favorites available");
+          break;
+        }
+
+        size_t selected = 0;
+        esp_err_t err = radio_stations_get_selected(&selected);
+        if (err != ESP_OK) {
+          ESP_LOGW(TAG, "IR: cannot read selected station: %s",
+                   esp_err_to_name(err));
+          break;
+        }
+
+        size_t next = (button_id_t)action == BTN_RADIO_NEXT
+                          ? (selected + 1) % count
+                          : (selected + count - 1) % count;
+
+        err = radio_stations_select(next);
+        if (err != ESP_OK) {
+          ESP_LOGW(TAG, "IR: station selection failed: %s",
+                   esp_err_to_name(err));
+          break;
+        }
+
+        ESP_LOGI(TAG, "IR: radio favorite %lu -> %lu",
+                 (unsigned long)selected, (unsigned long)next);
+
+        if (!streaming_mode_request_radio_restart()) {
+          ESP_LOGW(TAG, "IR: radio restart request failed");
+        }
+        break;
+      }
       case BTN_CHANNEL_CYCLE:
         audio_output_cycle_channel_mode();
         break;
