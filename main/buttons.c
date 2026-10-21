@@ -32,6 +32,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/timers.h"
+#include "radio/radio_stations.h"
 #include "streaming_mode.h"
 
 static const char *TAG = "buttons";
@@ -112,7 +113,39 @@ static void button_action_task(void *pvParameters) {
     if (xQueueReceive(s_action_queue, &action, portMAX_DELAY) == pdTRUE) {
       switch ((button_id_t)action) {
       case BTN_PLAY_PAUSE:
-        playback_control_play_pause();
+        if (streaming_mode_get() == STREAMING_MODE_RADIO) {
+          size_t count = radio_stations_count();
+          size_t selected = 0;
+
+          if (count == 0) {
+            ESP_LOGW(TAG, "EC11: no radio favorites available");
+            break;
+          }
+
+          esp_err_t err = radio_stations_get_selected(&selected);
+          if (err != ESP_OK) {
+            ESP_LOGW(TAG, "EC11: cannot read selected station: %s",
+                     esp_err_to_name(err));
+            break;
+          }
+
+          size_t next = (selected + 1) % count;
+          err = radio_stations_select(next);
+          if (err != ESP_OK) {
+            ESP_LOGW(TAG, "EC11: station selection failed: %s",
+                     esp_err_to_name(err));
+            break;
+          }
+
+          ESP_LOGI(TAG, "EC11: radio favorite %lu -> %lu",
+                   (unsigned long)selected, (unsigned long)next);
+
+          if (!streaming_mode_request_radio_restart()) {
+            ESP_LOGW(TAG, "EC11: radio restart request failed");
+          }
+        } else {
+          playback_control_play_pause();
+        }
         break;
       case BTN_VOLUME_UP:
         playback_control_volume_up();
