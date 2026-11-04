@@ -338,6 +338,7 @@ static esp_err_t tas58xx_read_reg(uint8_t reg, uint8_t *value);
 static esp_err_t tas58xx_init_one(tas58xx_dev_t *dev);
 static esp_err_t write_dsp_signal_path_defaults(void);
 static esp_err_t tas58xx_apply_input_mix(void);
+static esp_err_t bq_program_chain_muted(void);
 static esp_err_t tas58xx_run_init_seq(tas58xx_dev_t *dev);
 
 /* Linear scale the input mixer should apply to one output path. */
@@ -1527,10 +1528,26 @@ static void set_power_mode_dev(tas58xx_dev_t *dev, dac_power_mode_t mode) {
      * read back from the dump at load, so pushing it here restores that
      * tuning — or the user's edit of it.
      */
-    /* Diagnostic build: leave the chip on its stock DSP coefficients.
-     * Do not write custom DSP coefficient RAM or switch DSP_CTRL to 0.
-     * This isolates I2S, PBTL, power sequencing, and amplifier faults. */
-    ESP_LOGW(TAG, "DIAGNOSTIC: stock DSP coefficients retained; custom DSP skipped");
+    if (reached_play) {
+      esp_err_t mix_err = tas58xx_apply_input_mix();
+      if (mix_err != ESP_OK) {
+        ESP_LOGE(TAG, "@0x%02X DSP mixer restore failed: %s",
+                 dev->addr, esp_err_to_name(mix_err));
+      }
+
+      esp_err_t bq_err = bq_program_chain_muted();
+      if (bq_err != ESP_OK) {
+        ESP_LOGE(TAG, "@0x%02X DSP biquad restore failed: %s",
+                 dev->addr, esp_err_to_name(bq_err));
+      }
+
+      if (mix_err == ESP_OK && bq_err == ESP_OK) {
+        ESP_LOGI(TAG, "@0x%02X DSP configuration restored", dev->addr);
+      }
+    } else {
+      ESP_LOGW(TAG, "@0x%02X DSP restore deferred: PLAY not reached",
+               dev->addr);
+    }
 
 
     tas58xx_dump_status("power-on");

@@ -37,3 +37,18 @@ components/dac_tas58xx/TAS58xx Tuning Guide.pdf
 # with components/display/make_background.py; the driver renders a blank
 # background without it. See docs/features/tft-display.md.
 data/bg/
+
+# SBBoxOne: local development backups
+*.bak
+*.bak-*
+*.backup
+*.backup-*
+*.before-*
+*.before_*
+
+# SBBoxOne: private settings and local release archives
+/radio-favorites-backup.json
+/releases/
+
+# SBBoxOne: local flash dumps
+*FullFlash*.bin

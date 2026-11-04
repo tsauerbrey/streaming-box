@@ -1,3 +1,4 @@
+#include "../audio/usb_audio_sink.h"
 /*
  * Composite USB descriptors: UAC speaker (from espressif__usb_device_uac) plus
  * an HID consumer-control interface so the device can drive transport keys on
@@ -96,7 +97,7 @@ static char const *string_desc_arr[] = {
     // Windows names a composite function from its interface string, not
     // iProduct, so Device Manager shows this one rather than index 2.
     CONFIG_USB_AUDIO_SINK_PRODUCT, // 4: UAC control interface
-    "speaker",                     // 5: UAC streaming interface
+    "SBBoxOne",                     // 5: UAC streaming interface
     "media keys",                  // 6: HID interface
 };
 
@@ -161,8 +162,15 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
 //--------------------------------------------------------------------+
 void tud_mount_cb(void) {
   ESP_LOGI(TAG, "USB mounted");
+#ifdef CONFIG_USB_AUDIO_SINK
+  // A fresh USB enumeration must re-arm the safe volume limit.
+  usb_audio_sink_notify_disconnected();
+#endif
 }
 
 void tud_umount_cb(void) {
   ESP_LOGI(TAG, "USB unmounted");
+#ifdef CONFIG_USB_AUDIO_SINK
+  usb_audio_sink_notify_disconnected();
+#endif
 }

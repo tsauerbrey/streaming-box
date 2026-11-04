@@ -246,6 +246,8 @@ static void streaming_mode_task(void *pvParameters) {
         continue;
       }
 
+      display_radio_station_transition();
+
       if (!radio_player_stop_and_wait()) {
         ESP_LOGE(TAG, "Radio restart aborted: audio not released");
         continue;
@@ -297,6 +299,9 @@ static void streaming_mode_task(void *pvParameters) {
 
       s_streaming_mode = STREAMING_MODE_AIRPLAY;
 
+      // Radio has released I2S. USB may take over again.
+      usb_audio_sink_allow();
+
       if (ethernet_is_connected() || wifi_is_connected()) {
         start_airplay_services();
       } else {
@@ -306,19 +311,30 @@ static void streaming_mode_task(void *pvParameters) {
     } else {
       ESP_LOGI(TAG, "Streaming-Box: AIRPLAY -> RADIO");
 
-      // Do not enter RADIO while USB or Bluetooth owns the output.
+      // Bluetooth must release its output before entering RADIO.
       playback_source_t active_source = playback_control_get_source();
-      if (active_source == PLAYBACK_SOURCE_USB ||
-          active_source == PLAYBACK_SOURCE_BLUETOOTH) {
+      if (active_source == PLAYBACK_SOURCE_BLUETOOTH) {
         ESP_LOGW(TAG,
-                 "Mode switch denied: USB or Bluetooth owns audio output");
+                 "Mode switch denied: Bluetooth owns audio output");
         continue;
       }
+
+      // Block new USB takeovers and wait until the USB sink releases I2S.
+      ESP_LOGI(TAG, "Requesting USB audio release for RADIO mode");
+
+      if (!usb_audio_sink_release_and_wait()) {
+        ESP_LOGE(TAG, "Mode switch aborted: USB release failed");
+        usb_audio_sink_allow();
+        continue;
+      }
+
+      ESP_LOGI(TAG, "USB audio release acknowledged");
 
       // Stop AirPlay before the radio player takes ownership of I2S.
       if (!stop_airplay_services()) {
         ESP_LOGE(TAG,
                  "Mode switch aborted: AirPlay resources still active");
+        usb_audio_sink_allow();
         continue;
       }
 
@@ -333,6 +349,7 @@ static void streaming_mode_task(void *pvParameters) {
 
           // Restore AIRPLAY mode and services where possible.
           s_streaming_mode = STREAMING_MODE_AIRPLAY;
+          usb_audio_sink_allow();
           start_airplay_services();
           continue;
         }
@@ -440,6 +457,12 @@ static bool on_usb_audio_state_changed(bool streaming) {
     sendspin_set_output_available(false);
 #endif
     playback_control_set_source(PLAYBACK_SOURCE_USB);
+    return true;
+  }
+
+  if (usb_audio_sink_is_release_blocked()) {
+    ESP_LOGI(TAG, "USB audio released for mode switch");
+    playback_control_set_source(PLAYBACK_SOURCE_NONE);
     return true;
   }
 

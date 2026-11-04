@@ -163,7 +163,7 @@ if(CONFIG_USB_AUDIO_SINK AND CONFIG_USB_DEVICE_UAC_AS_PART)
         set(tinyusb_name espressif__tinyusb)
     endif()
     idf_component_get_property(tusb_lib ${tinyusb_name} COMPONENT_LIB)
-    idf_component_get_property(uac_dir espressif__usb_device_uac COMPONENT_DIR)
+    idf_component_get_property(uac_dir usb_device_uac COMPONENT_DIR)
     target_include_directories(${tusb_lib} PUBLIC
         "${COMPONENT_DIR}/usb" "${uac_dir}/tusb_uac")
     # Compiled into TinyUSB rather than main: CFG_TUSB_MCU and the OS include

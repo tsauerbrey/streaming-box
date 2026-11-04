@@ -35,6 +35,12 @@ static u8g2_t s_u8g2;
 // AVRCP callback, button action task, DACP client), read by the render task.
 static portMUX_TYPE s_display_mux = portMUX_INITIALIZER_UNLOCKED;
 
+// Handle used to wake the display task when the volume changes.
+static TaskHandle_t s_display_task_handle = NULL;
+
+#define RADIO_TRANSITION_TIMEOUT_US 5000000LL
+static int64_t s_radio_transition_until_us = 0;
+
 static struct {
   char title[METADATA_STRING_MAX];
   char artist[METADATA_STRING_MAX];
@@ -44,6 +50,8 @@ static struct {
   display_state_t state;
   bool dirty;           // set by event callback, cleared by render
   bool clock_mode;      // show centered clock instead of metadata
+  float volume_db;      // last requested volume in dB
+  int64_t volume_until_us; // overlay expiration timestamp
   int64_t sync_time_us; // esp_timer_get_time() when position was last synced
 } s_display;
 
@@ -57,6 +65,8 @@ typedef struct {
   uint32_t position_secs;
   display_state_t state;
   bool clock_mode;
+  float volume_db;
+  int64_t volume_until_us;
 } display_snapshot_t;
 
 // Scroll configuration. The interval is picked so the step lands on a whole
@@ -280,6 +290,38 @@ static void send_dirty_rows(void) {
   s_shadow_valid = true;
 }
 
+// Temporary volume screen for the 128x64 OLED.
+static void draw_volume_overlay(float db) {
+  if (db < -30.0f) db = -30.0f;
+  if (db > 0.0f) db = 0.0f;
+
+  char value[24];
+  snprintf(value, sizeof(value), "%.1f dB", db);
+
+  u8g2_SetFont(&s_u8g2, u8g2_font_7x14B_tf);
+  u8g2_DrawUTF8(&s_u8g2, 4, 17, "VOLUME");
+
+  u8g2_SetFont(&s_u8g2, u8g2_font_6x13_tf);
+  int value_w = u8g2_GetUTF8Width(&s_u8g2, value);
+  u8g2_DrawUTF8(&s_u8g2, 124 - value_w, 17, value);
+
+  const int bar_x = 4;
+  const int bar_y = 27;
+  const int bar_w = 120;
+  const int bar_h = 15;
+
+  u8g2_DrawFrame(&s_u8g2, bar_x, bar_y, bar_w, bar_h);
+
+  int fill = (int)((db + 30.0f) / 30.0f * (bar_w - 2) + 0.5f);
+  if (fill > 0) {
+    u8g2_DrawBox(&s_u8g2, bar_x + 1, bar_y + 1, fill, bar_h - 2);
+  }
+
+  u8g2_SetFont(&s_u8g2, u8g2_font_5x8_tf);
+  u8g2_DrawUTF8(&s_u8g2, 4, 55, "-30 dB");
+  u8g2_DrawUTF8(&s_u8g2, 102, 55, "0 dB");
+}
+
 static void display_render(void) {
   display_snapshot_t snap;
 
@@ -291,11 +333,21 @@ static void display_render(void) {
   snap.position_secs = estimated_position_locked();
   snap.state = s_display.state;
   snap.clock_mode = s_display.clock_mode;
+  snap.volume_db = s_display.volume_db;
+  snap.volume_until_us = s_display.volume_until_us;
+  s_display.dirty = false;
   taskEXIT_CRITICAL(&s_display_mux);
 
   u8g2_ClearBuffer(&s_u8g2);
   s_scroll.active = false;
   scroll_tick();
+
+  // Volume overlay takes priority over clock and playback metadata.
+  if (esp_timer_get_time() < snap.volume_until_us) {
+    draw_volume_overlay(snap.volume_db);
+    send_dirty_rows();
+    return;
+  }
 
   if (snap.clock_mode) {
     char clock_text[6] = "--:--";
@@ -406,13 +458,37 @@ static void display_render(void) {
 // Playback event callback
 // ============================================================================
 
+void display_radio_station_transition(void) {
+  taskENTER_CRITICAL(&s_display_mux);
+  s_radio_transition_until_us =
+      esp_timer_get_time() + RADIO_TRANSITION_TIMEOUT_US;
+  taskEXIT_CRITICAL(&s_display_mux);
+}
+
 static void on_playback_event(playback_source_t source, playback_event_t event,
                               const playback_event_data_t *data,
                               void *user_data) {
-  (void)source;
   (void)user_data;
 
   taskENTER_CRITICAL(&s_display_mux);
+
+  if (source == PLAYBACK_SOURCE_RADIO &&
+      event == PLAYBACK_EVENT_DISCONNECTED &&
+      s_radio_transition_until_us > esp_timer_get_time()) {
+    taskEXIT_CRITICAL(&s_display_mux);
+    return;
+  }
+
+  if (source == PLAYBACK_SOURCE_RADIO &&
+      event == PLAYBACK_EVENT_PLAYING) {
+    s_radio_transition_until_us = 0;
+  }
+
+  if (source != PLAYBACK_SOURCE_RADIO ||
+      event == PLAYBACK_EVENT_CONNECTED ||
+      event == PLAYBACK_EVENT_PAUSED) {
+    s_radio_transition_until_us = 0;
+  }
 
   switch (event) {
   case PLAYBACK_EVENT_CONNECTED:
@@ -501,64 +577,107 @@ static void on_playback_event(playback_source_t source, playback_event_t event,
 
 static void display_task(void *pvParameters) {
   (void)pvParameters;
+
   const TickType_t interval = pdMS_TO_TICKS(CONFIG_DISPLAY_UPDATE_MS);
   const TickType_t one_sec = pdMS_TO_TICKS(1000);
   const TickType_t scroll_interval = pdMS_TO_TICKS(SCROLL_INTERVAL_MS);
-  TickType_t last_wake = xTaskGetTickCount();
 
-  // Initial render
   display_render();
 
   while (1) {
-    bool is_playing = (s_display.state == DISPLAY_STATE_PLAYING);
     bool clock_mode;
+    bool is_playing;
+    int64_t volume_until_us;
+    int64_t radio_transition_until_us;
 
     taskENTER_CRITICAL(&s_display_mux);
+    if (s_radio_transition_until_us != 0 &&
+        esp_timer_get_time() >= s_radio_transition_until_us) {
+      s_radio_transition_until_us = 0;
+      s_display.state = DISPLAY_STATE_STANDBY;
+      memset(s_display.title, 0, sizeof(s_display.title));
+      memset(s_display.artist, 0, sizeof(s_display.artist));
+      memset(s_display.album, 0, sizeof(s_display.album));
+      s_display.duration_secs = 0;
+      s_display.position_secs = 0;
+      s_display.sync_time_us = 0;
+      s_display.dirty = true;
+    }
+
     clock_mode = s_display.clock_mode;
+    is_playing = (s_display.state == DISPLAY_STATE_PLAYING);
+    volume_until_us = s_display.volume_until_us;
+    radio_transition_until_us = s_radio_transition_until_us;
     taskEXIT_CRITICAL(&s_display_mux);
 
-    if (clock_mode) {
-      vTaskDelay(one_sec);
-      last_wake = xTaskGetTickCount();
-      s_display.dirty = false;
-      display_render();
-      continue;
+    const int64_t now_us = esp_timer_get_time();
+    const bool volume_active = now_us < volume_until_us;
+
+    TickType_t wait_ticks;
+
+    if (volume_active) {
+      // Wait until the overlay expires or another change arrives.
+      int64_t remaining_us = volume_until_us - now_us;
+      wait_ticks = pdMS_TO_TICKS((remaining_us + 999) / 1000);
+      if (wait_ticks < 1) {
+        wait_ticks = 1;
+      }
+    } else if (clock_mode) {
+      wait_ticks = one_sec;
+    } else if (s_scroll.active) {
+      wait_ticks = scroll_interval;
+    } else if (is_playing) {
+      wait_ticks = one_sec;
+    } else {
+      wait_ticks = interval;
     }
 
-    if (s_scroll.active) {
-      // A plain delay would add each render to the frame period, tying the
-      // scroll speed to I2C timing rather than to the clock.
-      if (xTaskDelayUntil(&last_wake, scroll_interval) == pdFALSE) {
-        // Already past the deadline, so xTaskDelayUntil did not block. Yield
-        // the minimum to keep the loop from spinning, then restart the cadence
-        // from now; waiting out another whole interval would stall the scroll
-        // exactly when it is already behind.
-        vTaskDelay(1);
-        last_wake = xTaskGetTickCount();
+    // Also wake when the radio transition deadline expires.
+    if (radio_transition_until_us > now_us) {
+      int64_t remaining_ms =
+          (radio_transition_until_us - now_us + 999) / 1000;
+      TickType_t transition_ticks = pdMS_TO_TICKS(remaining_ms);
+      if (transition_ticks < 1) {
+        transition_ticks = 1;
       }
-      s_display.dirty = false;
-      display_render();
-      continue;
+      if (transition_ticks < wait_ticks) {
+        wait_ticks = transition_ticks;
+      }
     }
-    if (is_playing) {
-      vTaskDelay(one_sec);
-      last_wake = xTaskGetTickCount();
-      s_display.dirty = false;
-      display_render();
-      continue;
-    }
-    vTaskDelay(interval);
-    last_wake = xTaskGetTickCount();
-    if (s_display.dirty) {
-      s_display.dirty = false;
-      display_render();
-    }
+
+    // A volume change interrupts the wait immediately.
+    ulTaskNotifyTake(pdTRUE, wait_ticks);
+
+    // Render after notifications and timer expiry.
+    // This also restores the previous screen after the overlay.
+    display_render();
   }
 }
 
 // ============================================================================
 // Clock display mode
 // ============================================================================
+
+void display_show_volume(float volume_db) {
+  // Clamp to the supported volume range.
+  if (volume_db < -30.0f) {
+    volume_db = -30.0f;
+  }
+  if (volume_db > 0.0f) {
+    volume_db = 0.0f;
+  }
+
+  taskENTER_CRITICAL(&s_display_mux);
+  s_display.volume_db = volume_db;
+  s_display.volume_until_us = esp_timer_get_time() + 2000000LL;
+  s_display.dirty = true;
+  taskEXIT_CRITICAL(&s_display_mux);
+
+  // Wake the display task immediately when a volume change arrives.
+  if (s_display_task_handle != NULL) {
+    xTaskNotifyGive(s_display_task_handle);
+  }
+}
 
 void display_set_clock_mode(bool enabled) {
   taskENTER_CRITICAL(&s_display_mux);
@@ -717,7 +836,13 @@ void display_init(void *bus) {
 
   // Start display refresh task. Left unpinned: SendBuffer blocks eight times a
   // frame, and the audio core wakes every 5.8 ms, so affinity there is costly.
-  xTaskCreate(display_task, "display", 4096, NULL, 3, NULL);
+  BaseType_t task_created = xTaskCreate(
+      display_task, "display", 4096, NULL, 3,
+      &s_display_task_handle);
+
+  if (task_created != pdPASS) {
+    ESP_LOGE(TAG, "Failed to create OLED display task");
+  }
 
   ESP_LOGI(TAG, "OLED display initialized");
 }

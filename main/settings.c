@@ -4,6 +4,7 @@
 #include "settings.h"
 
 #include "dac.h"
+#include "display.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "nvs.h"
@@ -130,6 +131,10 @@ esp_err_t settings_set_volume(float volume_db) {
   g_volume_db = volume_db;
   g_volume_loaded = true;
   g_volume_dirty = true;
+
+  // Show the new level temporarily on the OLED.
+  display_show_volume(volume_db);
+
   return ESP_OK;
 }
 
