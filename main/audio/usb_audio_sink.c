@@ -22,6 +22,7 @@
 
 #include "audio_output.h"
 #include "dac.h"
+#include "display.h"
 #include "led.h"
 #include "playback_events.h"
 #include "settings.h"
@@ -92,9 +93,23 @@ static const char *TAG = "usb_sink";
 #define VOLUME_MIN_DB (-30.0f)
 #define VOLUME_MAX_DB 0.0f
 
+// Clamp USB volume to the supported DAC control range.
+static float usb_safe_volume_db(float db) {
+  if (db < VOLUME_MIN_DB) return VOLUME_MIN_DB;
+  if (db > VOLUME_MAX_DB) return VOLUME_MAX_DB;
+  return db;
+}
+
 static RingbufHandle_t s_ringbuf;
 static TaskHandle_t s_task;
 static usb_audio_sink_state_cb_t s_state_cb;
+
+// Cross-task USB/I2S handover control.
+// The mode controller requests release; the sink task owns the actual
+// transition and acknowledges it by clearing s_streaming.
+static _Atomic bool s_takeover_allowed = true;
+static _Atomic bool s_release_requested = false;
+static _Atomic bool s_release_acknowledged = false;
 
 static volatile bool s_streaming;
 static volatile int64_t s_last_rx_us;
@@ -119,6 +134,54 @@ static uint32_t s_stream_gap_max_us;
 static _Atomic int32_t s_pending_volume = -1;
 static _Atomic int32_t s_pending_mute = -1;
 static float s_unmuted_db = -15.0f;
+static float s_last_effective_usb_db = -15.0f;
+static bool s_usb_volume_guard = true;
+static bool s_usb_trim_enabled = false;
+
+// USB-only level alignment: +1.5 dB at the volume API corresponds
+// to approximately +3 dB at the TAS5825M in its normal range.
+// Never apply this boost while the reconnect safety guard is active.
+#define USB_LEVEL_TRIM_DB 0.0f
+
+static float usb_output_volume_db(void) {
+  float db = usb_safe_volume_db(s_unmuted_db);
+
+  // Apply alignment only above the conservative startup range.
+  // Keep the transition continuous to avoid a sudden volume jump.
+  if (s_usb_trim_enabled && !s_usb_volume_guard && db > -20.0f) {
+    float trim = db + 20.0f;
+
+    if (trim > USB_LEVEL_TRIM_DB) {
+      trim = USB_LEVEL_TRIM_DB;
+    }
+
+    db = usb_safe_volume_db(db + trim);
+  }
+
+  return db;
+}
+static _Atomic int32_t s_local_volume_steps = 0;
+static int32_t s_last_host_volume = -1;
+static bool s_usb_volume_relative = false;
+static float s_usb_volume_offset_db = 0.0f;
+static _Atomic bool s_usb_disconnected = false;
+
+void usb_audio_sink_notify_local_volume(int direction) {
+  if (direction > 0) {
+    atomic_fetch_add(&s_local_volume_steps, 1);
+  } else if (direction < 0) {
+    atomic_fetch_sub(&s_local_volume_steps, 1);
+  }
+}
+
+void usb_audio_sink_notify_disconnected(void) {
+  // Discard controls belonging to the disconnected USB session.
+  atomic_store(&s_pending_volume, -1);
+  atomic_store(&s_pending_mute, -1);
+  atomic_store(&s_local_volume_steps, 0);
+  atomic_store(&s_usb_disconnected, true);
+}
+
 // Latched mute state, owned by the sink task.
 static bool s_muted;
 
@@ -175,28 +238,104 @@ static void uac_set_volume_cb(uint32_t volume, void *cb_ctx) {
   if (volume > 100) {
     volume = 100;
   }
+  ESP_LOGI(TAG, "UAC SET_CUR received: %" PRIu32 " %%", volume);
   atomic_store(&s_pending_volume, (int32_t)volume);
 }
 
 static void apply_host_controls(void) {
+  // Handle a pending USB disconnect before processing host controls.
+  if (atomic_exchange(&s_usb_disconnected, false)) {
+    s_usb_volume_guard = true;
+    s_usb_trim_enabled = false;
+    s_usb_volume_relative = false;
+    s_usb_volume_offset_db = 0.0f;
+    s_last_host_volume = -1;
+
+    // Limit the retained USB level after disconnect.
+    // Do not touch the DAC: another source may own it.
+    if (s_last_effective_usb_db > -25.0f) {
+      s_last_effective_usb_db = -25.0f;
+    }
+    s_unmuted_db = s_last_effective_usb_db;
+
+    ESP_LOGI(TAG, "USB volume reconnect guard armed");
+  }
+
   int32_t mute = atomic_exchange(&s_pending_mute, -1);
+  int32_t volume = atomic_exchange(&s_pending_volume, -1);
+  int32_t steps = atomic_exchange(&s_local_volume_steps, 0);
+
+  if (volume >= 0 || steps != 0) {
+    ESP_LOGI(TAG,
+             "USB volume diagnostic: host=%ld previous=%ld "
+             "local_steps=%ld guard=%d relative=%d",
+             (long)volume,
+             (long)s_last_host_volume,
+             (long)steps,
+             (int)s_usb_volume_guard,
+             (int)s_usb_volume_relative);
+  }
+
   if (mute >= 0) {
     s_muted = (mute == 1);
     ESP_LOGI(TAG, "Host %s", s_muted ? "muted" : "unmuted");
   }
 
-  int32_t volume = atomic_exchange(&s_pending_volume, -1);
-  if (volume >= 0) {
-    s_unmuted_db = VOLUME_MIN_DB +
-                   ((float)volume / 100.0f) * (VOLUME_MAX_DB - VOLUME_MIN_DB);
-    ESP_LOGI(TAG, "Host volume %" PRId32 " %% -> %.1f dB", volume,
-             s_unmuted_db);
+  // Local EC11/IR input takes precedence over a simultaneous
+  // UAC response. The response updates the host reference only.
+  if (steps != 0) {
+    s_unmuted_db = usb_safe_volume_db(
+        s_last_effective_usb_db + (float)steps * 1.0f);
+    s_last_effective_usb_db = s_unmuted_db;
+
+    if (s_unmuted_db >= -20.0f) {
+      s_usb_trim_enabled = true;
+    }
+
+    if (volume >= 0) {
+      s_last_host_volume = volume;
+    }
+
+    if (s_last_host_volume >= 0) {
+      s_usb_volume_guard = false;
+      s_usb_volume_relative = true;
+    }
+
+    ESP_LOGI(TAG, "Local USB volume: %.1f dB", s_unmuted_db);
+
+  } else if (volume >= 0) {
+    float requested_db = usb_safe_volume_db(
+        VOLUME_MIN_DB +
+        ((float)volume / 100.0f) *
+        (VOLUME_MAX_DB - VOLUME_MIN_DB));
+
+    if (s_usb_volume_guard) {
+      // Automatic host commands may reduce, but never increase,
+      // the protected output level.
+      if (requested_db < s_last_effective_usb_db) {
+        s_last_effective_usb_db = requested_db;
+      }
+
+      s_unmuted_db = s_last_effective_usb_db;
+
+    } else if (s_usb_volume_relative) {
+      // Diagnostic phase: do not apply host updates twice.
+      // Local EC11/IR steps remain authoritative.
+      s_unmuted_db = s_last_effective_usb_db;
+    }
+
+    s_last_host_volume = volume;
   }
 
-  // Mute is a latched state, not an event: a volume change while muted must
-  // update s_unmuted_db without lifting the mute.
-  if (mute >= 0 || volume >= 0) {
-    dac_set_volume(s_muted ? VOLUME_MIN_DB : s_unmuted_db);
+  // Only USB playback may change the shared DAC here.
+  // Radio and AirPlay retain exclusive control while USB is idle.
+  if (s_streaming && (mute >= 0 || volume >= 0 || steps != 0)) {
+    dac_set_volume(
+        s_muted ? VOLUME_MIN_DB : usb_output_volume_db());
+  }
+
+  if (volume >= 0 || steps != 0) {
+    display_show_volume(usb_safe_volume_db(s_unmuted_db));
   }
 }
 
@@ -261,13 +400,47 @@ static void usb_sink_task(void *arg) {
   static const int16_t silence[256] = {0};
 
   for (;;) {
+    // Process USB reconnects even before the host starts streaming.
+    // DAC writes remain disabled while USB does not own the output.
+    apply_host_controls();
+
+    // Release USB ownership before radio starts using I2S.
+    if (atomic_load(&s_release_requested)) {
+      ringbuf_drain();
+
+      if (s_streaming) {
+        audio_output_flush();
+        playback_events_emit(PLAYBACK_SOURCE_USB,
+                             PLAYBACK_EVENT_DISCONNECTED, NULL);
+        s_streaming = false;
+      }
+
+      // Release playback ownership without restarting AirPlay.
+      // The mode controller will select RADIO after this acknowledgement.
+      if (s_state_cb != NULL) {
+        s_state_cb(false);
+      }
+
+      // Keep takeover blocked until the mode controller allows it.
+      atomic_store(&s_release_requested, false);
+      atomic_store(&s_release_acknowledged, true);
+      continue;
+    }
+
     if (!s_streaming) {
       // Idle: wait for the host to start pushing frames, then let a small
       // prefetch accumulate before taking the output over from AirPlay.
-      ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+      ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
       if (ringbuf_filled() < RINGBUF_PREFETCH) {
         continue;
       }
+      // A mode switch may have reserved I2S for Internet radio.
+      // Discard host audio instead of taking ownership.
+      if (!atomic_load(&s_takeover_allowed)) {
+        ringbuf_drain();
+        continue;
+      }
+
       ESP_LOGI(TAG, "Host stream started");
 
       // Obtain exclusive I2S ownership before changing its clock.
@@ -276,6 +449,23 @@ static void usb_sink_task(void *arg) {
         ringbuf_drain();
         continue;
       }
+
+      // Recheck after the ownership callback: a radio mode switch
+      // may have requested release while AirPlay was stopping.
+      if (!atomic_load(&s_takeover_allowed) ||
+          atomic_load(&s_release_requested)) {
+        ESP_LOGW(TAG, "USB takeover cancelled by mode switch");
+        ringbuf_drain();
+        continue;
+      }
+
+      // Apply any pending host volume/mute updates before USB playback.
+      apply_host_controls();
+
+      // Restore the current USB volume before enabling audio playback.
+      // Otherwise the DAC may still be at the previous source's level.
+      dac_set_volume(
+        s_muted ? VOLUME_MIN_DB : usb_output_volume_db());
 
       s_streaming = true;
 
@@ -309,7 +499,22 @@ static void usb_sink_task(void *arg) {
     void *data =
         xRingbufferReceiveUpTo(s_ringbuf, &item_size, pdMS_TO_TICKS(20), 512);
     if (data != NULL) {
-      audio_output_write(data, item_size, portMAX_DELAY);
+      if (s_muted) {
+        // USB mute must silence the PCM stream, not merely attenuate
+        // the TAS5825M to -30 dB.
+        static const uint8_t muted_pcm[512] = {0};
+        size_t remaining = item_size;
+
+        while (remaining > 0) {
+          size_t chunk = remaining < sizeof(muted_pcm)
+                             ? remaining : sizeof(muted_pcm);
+          audio_output_write(muted_pcm, chunk, pdMS_TO_TICKS(20));
+          remaining -= chunk;
+        }
+      } else {
+        audio_output_write(data, item_size, pdMS_TO_TICKS(20));
+      }
+
       vRingbufferReturnItem(s_ringbuf, data);
       continue;
     }
@@ -348,7 +553,20 @@ esp_err_t usb_audio_sink_init(usb_audio_sink_state_cb_t state_cb) {
     return ESP_ERR_INVALID_STATE;
   }
 
+  // Start USB audio at a conservative level, independently
+  // of the previously selected radio/AirPlay volume.
   (void)settings_get_volume(&s_unmuted_db);
+  s_unmuted_db = usb_safe_volume_db(s_unmuted_db);
+
+  if (s_unmuted_db > -25.0f) {
+    s_unmuted_db = -25.0f;
+  }
+
+  s_last_effective_usb_db = s_unmuted_db;
+  s_usb_volume_guard = true;
+  s_usb_trim_enabled = false;
+  s_usb_volume_relative = false;
+  s_last_host_volume = -1;
 
   s_state_cb = state_cb;
   s_last_rx_us = esp_timer_get_time();
@@ -402,4 +620,46 @@ esp_err_t usb_audio_sink_init(usb_audio_sink_state_cb_t state_cb) {
 
 bool usb_audio_sink_is_streaming(void) {
   return s_streaming;
+}
+
+bool usb_audio_sink_release_and_wait(void) {
+  // Prevent any new USB takeover before requesting release.
+  atomic_store(&s_takeover_allowed, false);
+  atomic_store(&s_release_acknowledged, false);
+  atomic_store(&s_release_requested, true);
+
+  if (s_task == NULL) {
+    atomic_store(&s_release_requested, false);
+    atomic_store(&s_release_acknowledged, true);
+    return true;
+  }
+
+  // Wake the sink even if it is waiting for USB packets.
+  xTaskNotifyGive(s_task);
+
+  const TickType_t timeout = pdMS_TO_TICKS(3000);
+  const TickType_t start = xTaskGetTickCount();
+
+  while (!atomic_load(&s_release_acknowledged)) {
+    if ((xTaskGetTickCount() - start) >= timeout) {
+      ESP_LOGE(TAG, "USB audio release timed out");
+      return false;
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+
+  ESP_LOGI(TAG, "USB audio released I2S ownership");
+  return true;
+}
+
+bool usb_audio_sink_is_release_blocked(void) {
+  return !atomic_load(&s_takeover_allowed);
+}
+
+void usb_audio_sink_allow(void) {
+  atomic_store(&s_release_requested, false);
+  atomic_store(&s_takeover_allowed, true);
+  if (s_task != NULL) {
+    xTaskNotifyGive(s_task);
+  }
 }

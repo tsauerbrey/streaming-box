@@ -4,6 +4,10 @@
 #pragma once
 
 #include "esp_err.h"
+
+// Called when the USB host disconnects.
+void usb_audio_sink_notify_disconnected(void);
+
 #include <stdbool.h>
 
 /**
@@ -31,3 +35,31 @@ esp_err_t usb_audio_sink_init(usb_audio_sink_state_cb_t state_cb);
  * True while the host is actively sending audio.
  */
 bool usb_audio_sink_is_streaming(void);
+
+/**
+ * Request that USB audio relinquish I2S ownership.
+ *
+ * Blocks new USB takeover attempts until USB audio is explicitly
+ * allowed again. Waits for the sink task to finish writing to I2S.
+ *
+ * @return true if USB audio has released I2S, false on timeout.
+ */
+bool usb_audio_sink_release_and_wait(void);
+
+/**
+ * Allow USB audio to take over I2S again when the host streams.
+ */
+void usb_audio_sink_allow(void);
+
+/**
+ * True while USB takeover is blocked for a mode change.
+ */
+bool usb_audio_sink_is_release_blocked(void);
+
+/**
+ * Notify the USB sink about an explicit local volume action
+ * (rotary encoder or IR remote).
+ *
+ * direction: +1 = louder, -1 = quieter.
+ */
+void usb_audio_sink_notify_local_volume(int direction);

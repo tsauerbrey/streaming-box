@@ -26,6 +26,7 @@
 #include "playback_events.h"
 #include "rtsp_server.h"
 #include "settings.h"
+#include "display.h"
 
 #include "esp_log.h"
 
@@ -39,6 +40,10 @@
 
 #ifdef CONFIG_SENDSPIN_ENABLE
 #include "sendspin.h"
+
+#ifdef CONFIG_USB_AUDIO_SINK
+#include "audio/usb_audio_sink.h"
+#endif
 #endif
 
 static const char *TAG = "playback_ctrl";
@@ -115,7 +120,11 @@ static float dacp_percent_to_db(float percent) {
 // setting in step so the web UI and the level getter agree.
 static void apply_level(float db) {
   if (s_muted) {
-    s_pre_mute_db = db;
+    if (db != s_pre_mute_db) {
+      s_pre_mute_db = db;
+      // Show the selected level without unmuting the amplifier.
+      display_show_volume(db);
+    }
   } else {
     settings_set_volume(db);
   }
@@ -207,7 +216,12 @@ void playback_control_volume_up(void) {
 #endif
 #ifdef CONFIG_USB_AUDIO_SINK
   case PLAYBACK_SOURCE_USB:
-    usb_hid_control_send(USB_HID_KEY_VOLUME_UP);
+    usb_audio_sink_notify_local_volume(+1);
+    esp_err_t hid_err = usb_hid_control_send(USB_HID_KEY_VOLUME_UP);
+    if (hid_err != ESP_OK) {
+      ESP_LOGW(TAG, "USB volume up HID failed: %s",
+               esp_err_to_name(hid_err));
+    }
     break;
 #endif
   default:
@@ -233,7 +247,12 @@ void playback_control_volume_down(void) {
 #endif
 #ifdef CONFIG_USB_AUDIO_SINK
   case PLAYBACK_SOURCE_USB:
-    usb_hid_control_send(USB_HID_KEY_VOLUME_DOWN);
+    usb_audio_sink_notify_local_volume(-1);
+    esp_err_t hid_err = usb_hid_control_send(USB_HID_KEY_VOLUME_DOWN);
+    if (hid_err != ESP_OK) {
+      ESP_LOGW(TAG, "USB volume down HID failed: %s",
+               esp_err_to_name(hid_err));
+    }
     break;
 #endif
   default:

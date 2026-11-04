@@ -31,6 +31,17 @@ void display_init(void *bus);
 /** Show or hide the centered system clock. */
 void display_set_clock_mode(bool enabled);
 
+/**
+ * Temporarily show the current volume on the OLED.
+ * Each call restarts the 2-second display timeout.
+ *
+ * @param volume_db Volume in dB (-30.0 to 0.0).
+ */
+void display_show_volume(float volume_db);
+
+/** Preserve radio metadata briefly during a deliberate station change. */
+void display_radio_station_transition(void);
+
 #else
 
 static inline void display_init(void *bus) {
@@ -39,6 +50,13 @@ static inline void display_init(void *bus) {
 
 static inline void display_set_clock_mode(bool enabled) {
   (void)enabled;
+}
+
+static inline void display_radio_station_transition(void) {
+}
+
+static inline void display_show_volume(float volume_db) {
+  (void)volume_db;
 }
 
 #endif

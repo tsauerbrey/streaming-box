@@ -206,6 +206,17 @@ static void button_action_task(void *pvParameters) {
         break;
       case BTN_RADIO_NEXT:
       case BTN_RADIO_PREV: {
+        // USB-Audio: IR left/right controls the host's media player.
+        if (playback_control_get_source() == PLAYBACK_SOURCE_USB) {
+          if ((button_id_t)action == BTN_RADIO_NEXT) {
+            playback_control_next();
+          } else {
+            playback_control_prev();
+          }
+          break;
+        }
+
+        // Internet radio: retain the existing station navigation.
         if (streaming_mode_get() != STREAMING_MODE_RADIO) {
           break;
         }

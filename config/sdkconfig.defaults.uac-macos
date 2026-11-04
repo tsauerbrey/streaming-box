@@ -1,0 +1,2 @@
+# Streaming-Box USB Audio - macOS
+CONFIG_UAC_SUPPORT_MACOS=y
